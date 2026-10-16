@@ -23,21 +23,38 @@ struct ContentView: View {
                 }
                 if session.source != nil {
                     VStack(spacing: 0) {
-                        HStack(spacing: 16) {
-                            Picker("表示", selection: $session.mode) {
-                                Text("単体").tag(DisplayMode.single)
-                                Text("見開き").tag(DisplayMode.spread)
-                            }.pickerStyle(.segmented).frame(width: 130)
-                            Picker("開き方向", selection: $session.direction) {
-                                Text("右開き").tag(ReadingDirection.rightToLeft)
-                                Text("左開き").tag(ReadingDirection.leftToRight)
-                            }.pickerStyle(.segmented).frame(width: 150)
-                            Spacer(minLength: 0)
-                            Button(action: openPanel) { Image(systemName: "folder") }.help("ファイルを開く")
-                        }.padding(12).background(.regularMaterial)
+                        VStack(spacing: 8) {
+                            HStack(spacing: 8) {
+                                Picker("表示", selection: $session.mode) {
+                                    Text("単体").tag(DisplayMode.single)
+                                    Text("見開き").tag(DisplayMode.spread)
+                                }.pickerStyle(.segmented).frame(width: 100)
+                                Picker("開き方向", selection: $session.direction) {
+                                    Text("右開き").tag(ReadingDirection.rightToLeft)
+                                    Text("左開き").tag(ReadingDirection.leftToRight)
+                                }.pickerStyle(.segmented).frame(width: 116)
+                                Spacer(minLength: 0)
+                                Toggle(isOn: $session.loupeEnabled) { Image(systemName: "plus.magnifyingglass") }
+                                    .toggleStyle(.button).help("ルーペ").accessibilityLabel("ルーペ")
+                                Button(action: openPanel) { Image(systemName: "folder") }.help("ファイルを開く")
+                            }
+                            HStack(spacing: 12) {
+                                Button(action: session.toggleSlideshow) {
+                                    Label(session.isSlideshowPlaying ? "停止" : "自動再生", systemImage: session.isSlideshowPlaying ? "stop.fill" : "play.fill")
+                                }.disabled(!session.isSlideshowPlaying && !session.canStartSlideshow)
+                                Menu("\(session.slideshowInterval.formatted())秒") {
+                                    ForEach([0.5, 1, 3, 5, 10, 30], id: \.self) { value in
+                                        Button("\(value.formatted())秒") { session.setSlideshowInterval(String(value)) }
+                                    }
+                                    Divider()
+                                    Button("間隔を指定…") { session.isEditingInterval = true }
+                                }.accessibilityLabel("再生間隔")
+                                Spacer(minLength: 0)
+                            }
+                        }.padding(10).background(.regularMaterial)
                             .opacity(hoverControls ? 1 : 0).allowsHitTesting(hoverControls).accessibilityHidden(!hoverControls)
                         Color.clear.frame(height: 16)
-                    }.frame(height: 66).onHover { hoverControls = $0 }
+                    }.frame(height: 102).onHover { hoverControls = $0 }
                 }
                 if session.isLoading {
                     VStack(spacing: 12) {
@@ -60,7 +77,10 @@ struct ContentView: View {
             }
             return true
         }
-        .alert("開けませんでした", isPresented: Binding(get: { session.errorMessage != nil }, set: { if !$0 { session.errorMessage = nil } })) {
+        .sheet(isPresented: $session.isEditingInterval) {
+            SlideshowIntervalEditor(session: session)
+        }
+        .alert(session.errorTitle, isPresented: Binding(get: { session.errorMessage != nil }, set: { if !$0 { session.errorMessage = nil } })) {
             Button("OK") { session.errorMessage = nil }
         } message: { Text(session.errorMessage ?? "") }
     }
@@ -95,5 +115,37 @@ private struct PageIndicator: View {
                     }
                 }
         }.frame(height: 32)
+    }
+}
+
+private struct SlideshowIntervalEditor: View {
+    @Bindable var session: ReaderSession
+    @State private var text = ""
+    @State private var invalid = false
+    @FocusState private var focused: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("再生間隔").font(.headline)
+            Text("0.5〜100,000秒を0.5秒刻みで指定してください。")
+            HStack {
+                TextField("秒", text: $text).focused($focused).frame(width: 150).onSubmit(apply)
+                Stepper("秒", onIncrement: { step(0.5) }, onDecrement: { step(-0.5) }).labelsHidden()
+            }
+            if invalid { Text("有効な秒数を0.5秒刻みで入力してください。").foregroundStyle(.red).accessibilityLabel("再生間隔の入力エラー") }
+            HStack {
+                Spacer()
+                Button("キャンセル") { session.isEditingInterval = false }.keyboardShortcut(.cancelAction)
+                Button("適用", action: apply).keyboardShortcut(.defaultAction)
+            }
+        }.padding(24).frame(width: 380)
+            .onAppear { text = String(session.slideshowInterval); focused = true }
+    }
+    private func step(_ amount: Double) {
+        let value = SlideshowInterval.parse(text) ?? session.slideshowInterval
+        text = String(min(100_000, max(0.5, value + amount))); invalid = false
+    }
+    private func apply() {
+        if session.setSlideshowInterval(text) { session.isEditingInterval = false }
+        else { invalid = true }
     }
 }

@@ -25,6 +25,7 @@ public enum ArchiveReader {
 
     public static func extract(_ url: URL, into directory: URL, limits: ReaderLimits = ReaderLimits(),
                                include: (String) -> Bool = isImagePath,
+                               reserveBytes: (Int64) throws -> Void = { _ in },
                                progress: @Sendable (Int) -> Void = { _ in }) throws -> [ExtractedEntry] {
         // libarchive converts names using the calling thread's locale. Do not change the process locale.
         guard let utf8Locale = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", nil) else {
@@ -79,6 +80,7 @@ public enum ArchiveReader {
                     guard entryBytes <= limits.imageBytes else { throw ReaderError.limit("単一画像の展開量") }
                     guard totalBytes <= limits.sourceBytes else { throw ReaderError.limit("ソース累積展開量") }
                     guard totalBytes <= limits.temporaryBytes else { throw ReaderError.limit("一時ディスクキャッシュ2GiB") }
+                    try reserveBytes(Int64(size))
                     try handle.write(contentsOf: Data(buffer.prefix(size)))
                 }
                 try handle.close()
@@ -94,6 +96,11 @@ public enum ArchiveReader {
     }
 
     private static func error(_ reader: OpaquePointer) -> ReaderError {
+        switch archive_errno(reader) {
+        case EACCES, EPERM: return .permission
+        case ENOENT: return .missing
+        default: break
+        }
         let detail = archive_error_string(reader).map { String(cString: $0) } ?? "不明な展開エラー"
         let lower = detail.lowercased()
         if lower.contains("encrypt") || lower.contains("passphrase") || lower.contains("password") { return .encrypted }

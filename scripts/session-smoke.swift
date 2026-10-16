@@ -16,13 +16,13 @@ import MagvCore
             for page in 1...4 { try data.write(to: dir.appendingPathComponent("\(page).png")) }
             folders.append(dir)
         }
-        let session = ReaderSession()
+        let session = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("cache"))
         func require(_ condition: Bool, _ message: String) throws {
             if !condition { throw NSError(domain: "SessionSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
         }
         func waitForOpen() async throws {
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-            while session.isLoading || session.isRendering {
+            while session.isLoading || session.isRendering || session.isSelectingSource || session.isRenaming {
                 if ContinuousClock.now > deadline { throw NSError(domain: "SessionSmoke", code: 2, userInfo: [NSLocalizedDescriptionKey: "Open timed out"]) }
                 try await Task.sleep(for: .milliseconds(5))
             }
@@ -60,6 +60,252 @@ import MagvCore
             windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 115)!
         try require(InputRouter.command(for: home, direction: .rightToLeft) == .last, "RTL Home mapping failed")
         try require(InputRouter.command(for: home, direction: .leftToRight) == .first, "LTR Home mapping failed")
-        print("Session smoke passed: latest request, cancellation, failure retention, history, recent items, direct image, direction keys")
+        // Daily source switching preserves positions and stops at empty/deleted siblings.
+        session.switchSource(.next); try await waitForOpen()
+        try require(session.source?.url == folders[1], "Next sibling failed")
+        session.switchSource(.previous); try await waitForOpen()
+        try require(session.source?.url == folders[0] && session.page?.anchorIndex == 1, "Sibling revisit lost position")
+        try require(!session.canSwitch(.previous), "First sibling did not stop")
+        let beforeRandom = session.source?.url
+        session.switchSource(.random); try await waitForOpen()
+        try require(session.source?.url != beforeRandom, "Random selected the current source")
+        session.open(folders[20]); try await waitForOpen()
+        try require(!session.canSwitch(.next), "Last sibling did not stop")
+        let empty = root.appendingPathComponent("book1.5", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        session.open(folders[1]); try await waitForOpen()
+        session.switchSource(.next); try await waitForOpen()
+        try require(session.source?.url == folders[1] && session.errorMessage?.contains("表示できる画像がありません") == true, "Empty sibling replaced or skipped the current book")
+        session.errorMessage = nil
+        try FileManager.default.removeItem(at: empty)
+        session.switchSource(.next); try await waitForOpen()
+        try require(session.source?.url == folders[1] && session.errorMessage != nil, "Deleted sibling was silently skipped")
+        try require(!session.siblings.contains(empty), "Deleted sibling remained in the list")
+        session.errorMessage = nil
+
+        let archive = root.appendingPathComponent("a.b.ZIP")
+        try FileManager.default.copyItem(at: fixture.appendingPathComponent("images.zip"), to: archive)
+        session.open(archive); try await waitForOpen()
+        let oldImagePaths = session.source!.images.map(\.fileURL)
+        session.jump(to: 2); try await waitForOpen()
+        session.authorizeDirectory(root)
+        session.beginRename(); try await waitForOpen()
+        try require(session.isEditingName, "Rename editor did not start")
+        func rename(_ name: String) async -> Result<Void, Error> {
+            await withCheckedContinuation { continuation in
+                session.renameArchive(to: name) { continuation.resume(returning: $0) }
+            }
+        }
+        let invalid = await rename("../invalid")
+        if case .success = invalid { throw NSError(domain: "SessionSmoke", code: 3) }
+        try require(session.isEditingName && session.source?.url == archive, "Rename failure lost editing or reader state")
+        let renamedResult = await rename("日本語 a.b")
+        try renamedResult.get()
+        session.isEditingName = false
+        let renamed = root.appendingPathComponent("日本語 a.b.ZIP")
+        try require(session.source?.url == renamed && session.title == "日本語 a.b.ZIP", "Rename title/identity did not update")
+        try require(session.page?.anchorIndex == 2 && session.source?.images.map(\.fileURL) == oldImagePaths, "Rename discarded page/cache data")
+        try require(!session.recentURLs.contains(archive) && session.recentURLs.contains(renamed), "Rename left old history identity")
+        session.open(folders[0]); try await waitForOpen()
+        session.open(renamed); try await waitForOpen()
+        try require(session.page?.anchorIndex == 2, "Renamed book position was not restored")
+        let conflict = root.appendingPathComponent("!日本語 a.b.ZIP")
+        try Data("existing bytes".utf8).write(to: conflict)
+        session.addBangPrefix(); try await waitForOpen()
+        let prefixed = root.appendingPathComponent("!日本語 a.b_.ZIP")
+        try require(session.source?.url == prefixed, "Bang prefix corrupted multiple-dot name or failed collision handling")
+        try require(try String(contentsOf: conflict, encoding: .utf8) == "existing bytes", "Bang prefix overwrote an existing file")
+        try require(try Data(contentsOf: prefixed) == Data(contentsOf: fixture.appendingPathComponent("images.zip")), "Rename changed archive contents")
+
+        // An access panel response for an earlier book must never edit a later book.
+        let permissionSession = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("other-cache"))
+        permissionSession.open(prefixed)
+        while permissionSession.isLoading || permissionSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
+        var grantCompletion: ((URL?) -> Void)?
+        permissionSession.requestDirectoryAccess = { directory, _, completion in
+            precondition(FileAccessService.sameLocation(directory, root)); grantCompletion = completion
+        }
+        permissionSession.beginRename()
+        try require(grantCompletion != nil && !permissionSession.isEditingName, "Rename assumed a file grant also authorized its parent")
+        permissionSession.open(folders[2])
+        while permissionSession.isLoading || permissionSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
+        grantCompletion?(root)
+        try require(permissionSession.source?.url == folders[2] && !permissionSession.isEditingName, "Stale folder grant edited another source")
+
+        try require(!RenameFieldEditor.shouldSubmit(hasMarkedText: true, wasComposing: false), "IME marked text submitted")
+        try require(!RenameFieldEditor.shouldSubmit(hasMarkedText: false, wasComposing: true), "IME commit Return also submitted")
+        try require(RenameFieldEditor.shouldSubmit(hasMarkedText: false, wasComposing: false), "Normal Return did not submit")
+        let bang = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "!", charactersIgnoringModifiers: "1", isARepeat: false, keyCode: 18)!
+        try require(InputRouter.action(for: bang, direction: .rightToLeft) == .addBang, "Bang depended on a physical key")
+        let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 125)!
+        try require(InputRouter.action(for: down, direction: .rightToLeft) == .source(.next), "Source key routing failed")
+        let store = SettingsStore(url: root.appendingPathComponent("settings.json"))
+        let preferences = ReaderPreferencesStore(store: store)
+        let settingsSession = ReaderSession(preferences: preferences)
+        settingsSession.mode = .single; settingsSession.direction = .leftToRight
+        preferences.setWindowFrame(CGRect(x: 30, y: 40, width: 640, height: 508)); preferences.flush()
+        let restored = ReaderSession(preferences: ReaderPreferencesStore(store: store))
+        try require(restored.mode == .single && restored.direction == .leftToRight && restored.source == nil && restored.recentURLs.isEmpty, "Persistence restored history or lost display preferences")
+        try require(store.load()?.window?.frame.width == 640, "Window frame wasn't persisted")
+        let access = SessionFileAccess()
+        let selectedImage = folders[0].appendingPathComponent("2.png")
+        access.retain(selectedImage); access.remember(source: folders[0], selected: selectedImage)
+        try require(access.reopeningURL(for: folders[0]) == selectedImage, "Recent image lost its original scoped URL")
+        access.retain(folders[1], asDirectoryGrant: true)
+        access.trim(to: [folders[0]])
+        try require(!access.covers(folders[1]), "Unused folder grants weren't released")
+        access.retain(folders[0], asDirectoryGrant: true)
+        try require(access.reopeningURL(for: folders[0]) == folders[0], "Folder grant did not replace partial image access")
+        let recentImageSession = ReaderSession(preferences: ReaderPreferencesStore(store: nil))
+        recentImageSession.open(selectedImage)
+        while recentImageSession.isLoading || recentImageSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
+        recentImageSession.jump(to: 3)
+        recentImageSession.open(folders[1])
+        while recentImageSession.isLoading || recentImageSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
+        recentImageSession.open(folders[0], userSelection: false)
+        while recentImageSession.isLoading || recentImageSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
+        try require(recentImageSession.page?.anchorIndex == 3, "Recent image source reset to the originally selected image")
+        try await readingAidSmoke(root: root, fixture: fixture, folder: folders[0])
+        print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
     }
+}
+
+// Intentionally ignore cancellation here, so stale timer completions exercise the session's generation guard.
+private actor SlideshowGate {
+    private var next = 0
+    private var waits: [Int: CheckedContinuation<Void, Error>] = [:]
+    private var delays: [Int: Duration] = [:]
+    func wait(_ delay: Duration) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            next += 1; waits[next] = continuation; delays[next] = delay
+        }
+    }
+    var count: Int { next }
+    func delay(_ id: Int) -> Duration? { delays[id] }
+    func fire(_ id: Int) { waits.removeValue(forKey: id)?.resume() }
+    func drain() { for continuation in waits.values { continuation.resume() }; waits.removeAll() }
+}
+
+@MainActor private func readingAidSmoke(root: URL, fixture: URL, folder: URL) async throws {
+    let gate = SlideshowGate()
+    let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("aid-cache"), wait: { try await gate.wait($0) })
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "ReadingAidSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    func settle() async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while reader.isLoading || reader.isRendering || reader.isSelectingSource || reader.isRenaming {
+            try require(ContinuousClock.now < deadline, "Reading aid render timed out")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    func timer(after previous: Int) async throws -> Int {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await gate.count <= previous {
+            try require(ContinuousClock.now < deadline, "Slideshow failed to schedule")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        return await gate.count
+    }
+    func fireAndSettle(_ id: Int) async throws {
+        await gate.fire(id); try await Task.sleep(for: .milliseconds(10)); try await settle()
+    }
+    try require(!reader.loupeEnabled && !reader.isSlideshowPlaying && reader.slideshowInterval == 5, "Reading aid defaults changed")
+    reader.open(folder); try await settle()
+    reader.toggleSlideshow()
+    var tick = try await timer(after: 0)
+    try require(await gate.delay(tick) == .seconds(5), "Initial interval was not five seconds")
+    try await fireAndSettle(tick)
+    try require(reader.page?.visibleIndices == [2, 3] && !reader.isSlideshowPlaying, "Spread slideshow did not advance once and stop at the final image")
+    reader.toggleSlideshow(); try require(!reader.isSlideshowPlaying, "Slideshow started at the end")
+
+    reader.mode = .single; reader.jump(to: 0); try await settle(); reader.toggleSlideshow()
+    tick = try await timer(after: tick)
+    let staleManual = tick
+    reader.move(.next); try await settle(); tick = try await timer(after: tick)
+    try await fireAndSettle(staleManual)
+    try require(reader.page?.anchorIndex == 1, "A timer from before manual navigation advanced the page")
+    try await fireAndSettle(tick); tick = try await timer(after: tick)
+    try require(reader.page?.anchorIndex == 2 && reader.isSlideshowPlaying, "Single-page slideshow advanced incorrectly")
+    let staleInterval = tick
+    try require(reader.setSlideshowInterval("0.5"), "Valid interval was rejected")
+    tick = try await timer(after: tick)
+    try require(await gate.delay(tick) == .milliseconds(500), "Interval change didn't reset the full wait")
+    try require(!reader.setSlideshowInterval("nan") && reader.slideshowInterval == 0.5, "Invalid interval replaced the current value")
+    try await fireAndSettle(staleInterval)
+    try require(reader.page?.anchorIndex == 2, "Stale interval timer advanced")
+    try await fireAndSettle(tick)
+    try require(reader.page?.anchorIndex == 3 && !reader.isSlideshowPlaying, "Final single page didn't stop playback")
+
+    reader.jump(to: 0); try await settle(); reader.toggleSlideshow(); tick = try await timer(after: tick)
+    let sleepTimer = tick
+    reader.suspendSlideshow(); try await fireAndSettle(sleepTimer)
+    try require(reader.page?.anchorIndex == 0 && reader.isSlideshowPlaying, "Sleep advanced or lost playback state")
+    reader.resumeSlideshow(); tick = try await timer(after: tick)
+    let beforeJump = tick
+    reader.jump(to: 1); try await settle(); tick = try await timer(after: tick)
+    try await fireAndSettle(beforeJump)
+    try require(reader.page?.anchorIndex == 1, "Direct page selection didn't reset elapsed time")
+    let beforeMode = tick
+    reader.mode = .spread; try await settle(); tick = try await timer(after: tick)
+    try await fireAndSettle(beforeMode)
+    try require(reader.page?.anchorIndex == 1, "Display recalculation didn't reset elapsed time")
+    let beforeDirection = tick
+    reader.direction = .leftToRight; tick = try await timer(after: tick)
+    try await fireAndSettle(beforeDirection)
+    try require(reader.page?.anchorIndex == 1, "Reading direction change didn't reset elapsed time")
+    reader.isEditingInterval = true
+    let beforeEditor = tick
+    try require(!reader.canRead && reader.isSlideshowPlaying, "Interval editing did not suspend reading")
+    try await fireAndSettle(beforeEditor)
+    try require(reader.page?.anchorIndex == 1, "Interval editor allowed timer navigation")
+    reader.setSlideshowInterval("10"); reader.isEditingInterval = false
+    tick = try await timer(after: tick)
+    try require(await gate.delay(tick) == .seconds(10), "Interval editor didn't restart the full wait")
+    reader.open(root.appendingPathComponent("missing-aid.zip")); try await settle()
+    try require(!reader.isSlideshowPlaying && reader.source?.url == folder, "Failed source switch continued slideshow or replaced the source")
+    reader.errorMessage = nil
+
+    reader.mode = .single; reader.jump(to: 0); try await settle(); reader.loupeEnabled = true
+    reader.requestLoupe(index: 0, displayedSize: CGSize(width: 300, height: 600), backingScale: 2)
+    let loupeDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while reader.loupeImage == nil {
+        try require(ContinuousClock.now < loupeDeadline, "Loupe decode timed out")
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    try require(reader.loupeIndex == 0, "Loupe referenced another image")
+    reader.move(.next); try await settle()
+    try require(reader.loupeImage == nil && reader.loupeIndex == nil, "Old loupe survived a page change")
+    reader.requestLoupe(index: 1, displayedSize: CGSize(width: 300, height: 600), backingScale: 2)
+    reader.handleMemoryPressure(critical: true)
+    try await Task.sleep(for: .milliseconds(20))
+    reader.requestLoupe(index: 1, displayedSize: CGSize(width: 300, height: 600), backingScale: 2)
+    try require(!reader.canUseLoupe && reader.loupeImage == nil && !reader.decoded.isEmpty, "Memory pressure rebuilt the loupe or lost the visible page")
+    reader.memoryPressureEnded(); try require(reader.canUseLoupe, "Loupe remained disabled after pressure ended")
+    reader.loupeEnabled = false
+    reader.toggleSlideshow(); tick = try await timer(after: tick)
+    reader.closeWindow(); try await fireAndSettle(tick)
+    try require(!reader.isSlideshowPlaying && reader.page?.anchorIndex == 1, "Window close left playback running")
+    reader.toggleSlideshow(); try require(!reader.isSlideshowPlaying && !reader.canRead, "Playback restarted while the reader window was closed")
+    reader.resumeWindow(); try await settle()
+    try require(reader.decoded[1] != nil, "Window reopen didn't restore rendering")
+
+    let bad = root.appendingPathComponent("bad-pages")
+    try FileManager.default.createDirectory(at: bad, withIntermediateDirectories: true)
+    try FileManager.default.copyItem(at: fixture.appendingPathComponent("portrait.png"), to: bad.appendingPathComponent("0.png"))
+    try Data("broken image".utf8).write(to: bad.appendingPathComponent("1.png"))
+    try FileManager.default.copyItem(at: fixture.appendingPathComponent("portrait.png"), to: bad.appendingPathComponent("2.png"))
+    reader.open(bad); try await settle(); reader.toggleSlideshow(); tick = try await timer(after: tick)
+    try await fireAndSettle(tick)
+    try require(reader.page?.anchorIndex == 1 && !reader.isSlideshowPlaying && reader.imageFailures[1] != nil, "Image failure didn't stop playback")
+    let archive = root.appendingPathComponent("aid-rename.zip")
+    try FileManager.default.copyItem(at: fixture.appendingPathComponent("images.zip"), to: archive)
+    reader.open(archive); try await settle(); reader.authorizeDirectory(root)
+    reader.toggleSlideshow(); tick = try await timer(after: tick)
+    reader.beginRename(); try await settle(); try await fireAndSettle(tick)
+    try require(reader.isEditingName && !reader.isSlideshowPlaying && reader.page?.anchorIndex == 0, "Rename didn't stop playback")
+    reader.isEditingName = false; reader.stopSlideshow(); await gate.drain()
+    reader.closeWindow()
 }

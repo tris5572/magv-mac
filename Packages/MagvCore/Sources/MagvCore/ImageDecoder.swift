@@ -26,15 +26,21 @@ public enum ImageDecoder {
         return (5...8).contains(orientation) ? ImageMetadata(width: height, height: width) : ImageMetadata(width: width, height: height)
     }
 
-    public static func decode(at url: URL, maxPixelSize: Int, limits: ReaderLimits = ReaderLimits()) throws -> DecodedImage {
-        _ = try metadata(at: url, limits: limits)
+    public static func decode(at url: URL, maxPixelSize: Int, limits: ReaderLimits = ReaderLimits(),
+                              maximumBytes: Int = 128 * 1024 * 1024) throws -> DecodedImage {
+        let metadata = try metadata(at: url, limits: limits)
         let source = try source(at: url, limits: limits)
+        let aspect = Double(max(metadata.width, metadata.height)) / Double(min(metadata.width, metadata.height))
+        // Allow eight bytes per pixel for 16-bit sources as well as ordinary RGBA images.
+        let bounded = max(1, Int(sqrt(Double(max(8, maximumBytes)) / 8 * aspect)))
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(1, min(maxPixelSize, 8192))]
+            kCGImageSourceThumbnailMaxPixelSize: max(1, min(maxPixelSize, 8192, bounded))]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
             throw ReaderError.invalidImage(url.lastPathComponent)
         }
-        return DecodedImage(image: image)
+        let decoded = DecodedImage(image: image)
+        guard decoded.byteCount <= maximumBytes else { throw ReaderError.limit("画像デコード用メモリ") }
+        return decoded
     }
 }

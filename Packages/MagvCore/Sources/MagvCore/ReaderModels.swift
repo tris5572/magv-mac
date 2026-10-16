@@ -1,9 +1,10 @@
 import Foundation
 
-public enum DisplayMode: String, CaseIterable, Sendable { case single, spread }
-public enum ReadingDirection: String, CaseIterable, Sendable { case rightToLeft, leftToRight }
+public enum DisplayMode: String, CaseIterable, Codable, Sendable { case single, spread }
+public enum ReadingDirection: String, CaseIterable, Codable, Sendable { case rightToLeft, leftToRight }
 public enum ImageOrientation: Sendable { case portrait, landscape, unknown }
 public enum PageCommand: CaseIterable, Sendable { case next, previous, nextImage, previousImage, first, last }
+public enum SourceCommand: CaseIterable, Sendable { case next, previous, random }
 
 public struct DisplayPage: Equatable, Sendable {
     public let anchorIndex: Int
@@ -42,7 +43,19 @@ public struct LoadedSource: Sendable {
     // Retains permission and temporary data for as long as the source is in use.
     public let access: FileAccessLease
     public let temporaryDirectory: TemporaryDirectory?
+    public let siblings: [URL]
+    public let needsParentAccess: Bool
+    public let isPartialDirectory: Bool
+    public let revision: FileRevision?
     public var title: String { url.lastPathComponent }
+
+    public func relocated(to newURL: URL) -> LoadedSource {
+        LoadedSource(url: newURL, kind: kind, images: images, initialIndex: initialIndex, access: access,
+            temporaryDirectory: temporaryDirectory,
+            siblings: siblings.map { FileAccessService.sameLocation($0, url) ? newURL : $0 }
+                .sorted { SourceFormat.naturalOrder($0.lastPathComponent, $1.lastPathComponent) },
+            needsParentAccess: needsParentAccess, isPartialDirectory: isPartialDirectory, revision: revision)
+    }
 }
 
 public struct ReaderLimits: Sendable {
@@ -58,6 +71,7 @@ public enum ReaderError: Error, LocalizedError, Equatable, Sendable {
     case unsupported, noImages, missing, permission
     case archive(String), encrypted, unsupportedCompression(String), unsafePath(String)
     case limit(String), invalidImage(String)
+    case invalidName, sourceChanged, rename(String)
 
     public var errorDescription: String? {
         switch self {
@@ -71,6 +85,9 @@ public enum ReaderError: Error, LocalizedError, Equatable, Sendable {
         case .unsafePath(let path): "安全でないアーカイブ内パスを検出しました。\n\(path)"
         case .limit(let name): "読み込み上限を超えました（\(name)）。"
         case .invalidImage(let name): "画像を読み込めません。\n\(name)"
+        case .invalidName: "名前が空、または使用できない文字が含まれています。区切り文字や制御文字は使用できません。"
+        case .sourceChanged: "ファイルが外部で変更されています。もう一度開いてから名前を変更してください。"
+        case .rename(let detail): "名前を変更できません。\n\(detail)"
         }
     }
 }
