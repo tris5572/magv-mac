@@ -1,6 +1,7 @@
 import AppKit
 import MagvCore
 import CArchive
+import ImageIO
 
 // Compiled with the actual app's ReaderSession and InputRouter by test.sh.
 @main struct SessionSmoke {
@@ -170,6 +171,7 @@ import CArchive
         try require(recentImageSession.page?.anchorIndex == 3, "Recent image source reset to the originally selected image")
         try await streamingNavigationSmoke(root: root, fixture: fixture)
         try await readingAidSmoke(root: root, fixture: fixture, folder: folders[0])
+        try await pagePresentationSmoke(root: root, fixture: fixture, verifyCanvas: CommandLine.arguments.contains("--ui"))
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
         if CommandLine.arguments.contains("--ui") { try await renameSheetSmoke(root: root, fixture: fixture) }
     }
@@ -240,7 +242,7 @@ import CArchive
                 let newURL = directory.appendingPathComponent(name).appendingPathExtension(oldURL.pathExtension)
                 try require(!FileManager.default.fileExists(atPath: oldURL.path), "Original file still exists after rename")
                 try require(try Data(contentsOf: newURL) == bytes, "Renamed file is missing or changed")
-                try require(session.source?.url == newURL && session.title == newURL.lastPathComponent && session.page == oldPage,
+                try require(session.source?.url == newURL && session.presentedPage?.sourceURL == newURL && session.title == newURL.lastPathComponent && session.page == oldPage,
                             "Rename sheet lost reader identity or page")
             case .failure:
                 try require(!succeeds && !finished && field.isEnabled && field.stringValue == name, "Failed rename lost the edited name")
@@ -251,6 +253,100 @@ import CArchive
     try await exercise(button: false, attempts: [("日本語 a.b", true)])
     try await exercise(button: true, attempts: [("invalid/name", false), ("変更ボタンで確定", true)])
     print("Rename sheet smoke passed: active field editor, Return/button, invalid-name retry, IME guard, on-disk rename")
+}
+
+@MainActor private func pagePresentationSmoke(root: URL, fixture: URL, verifyCanvas: Bool) async throws {
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "PagePresentationSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    let folder = root.appendingPathComponent("presentation-pages", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    for (index, color) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]].enumerated() {
+        let context = CGContext(data: nil, width: 32, height: 48, bitsPerComponent: 8, bytesPerRow: 128,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(red: color[0], green: color[1], blue: color[2], alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 32, height: 48))
+        let destination = CGImageDestinationCreateWithURL(folder.appendingPathComponent("\(index).png") as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, context.makeImage()!, nil)
+        try require(CGImageDestinationFinalize(destination), "Could not create colored test page")
+    }
+    try Data("broken image".utf8).write(to: folder.appendingPathComponent("4.png"))
+    let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("presentation-cache"))
+    defer { reader.shutdown() }
+    reader.mode = .single
+    func settle() async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while reader.isLoading || reader.isRendering {
+            try require(ContinuousClock.now < deadline, "Presentation timed out")
+            if let frame = reader.presentedPage {
+                try require(frame.page.visibleIndices.allSatisfy { frame.images[$0] != nil || frame.failureNames[$0] != nil }, "Published a partial frame")
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        try require(reader.presentedPage?.sourceURL == reader.source?.url && reader.presentedPage?.page == reader.page,
+                    "Presented frame did not catch up with navigation")
+    }
+    func pixels() -> Data? {
+        guard verifyCanvas else { return nil }
+        _ = NSApplication.shared
+        let canvas = CanvasView(session: reader)
+        canvas.frame = NSRect(x: 0, y: 0, width: 320, height: 480)
+        let context = CGContext(data: nil, width: 320, height: 480, bitsPerComponent: 8, bytesPerRow: 1280,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        canvas.draw(canvas.bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        return Data(bytes: context.data!, count: context.bytesPerRow * context.height)
+    }
+    reader.open(folder); try await settle()
+    reader.loupeEnabled = true
+    let first = reader.presentedPage!
+    let firstPixels = pixels()
+    reader.move(.next)
+    try require(reader.page?.anchorIndex == 1 && reader.presentedPage?.page == first.page && reader.decoded[0]?.image === first.images[0]?.image,
+                "Next page discarded the visible image before decode")
+    try require(!reader.canUseLoupe && pixels() == firstPixels, "Pending navigation changed the canvas or used an old loupe")
+    try await settle()
+    let secondPixels = pixels()
+    try require(!verifyCanvas || secondPixels != firstPixels, "Canvas never switched to the new colored page")
+    let second = reader.presentedPage!.page
+    reader.jump(to: 2); reader.jump(to: 3)
+    try require(reader.presentedPage?.page == second && pixels() == secondPixels, "Rapid jumps cleared the visible page")
+    try await settle()
+    try require(reader.presentedPage?.page.anchorIndex == 3, "An obsolete render replaced the latest jump")
+    reader.mode = .spread; reader.jump(to: 0); try await settle()
+    let spread = reader.presentedPage!
+    let spreadPixels = pixels()
+    reader.move(.next)
+    try require(reader.presentedPage?.page == spread.page && pixels() == spreadPixels, "Spread transition cleared or rearranged the previous spread")
+    try await settle()
+    try require(reader.presentedPage?.page.visibleIndices == [2, 3] && reader.decoded.count == 2, "Spread was not committed together")
+    let resizedPage = reader.presentedPage!.page
+    reader.updatePixelSize(3072)
+    try require(reader.presentedPage?.page == resizedPage && reader.decoded.count == 2, "Resize cleared the current spread")
+    try await settle()
+    reader.mode = .single; reader.jump(to: 0); try await settle()
+    reader.jump(to: 4)
+    try require(reader.presentedPage?.page.anchorIndex == 0, "Failed-image navigation cleared the old page early")
+    try await settle()
+    try require(reader.presentedPage?.failureNames[4] == "4.png" && reader.decoded.isEmpty, "Failed page left a stale image instead of an error slot")
+    reader.jump(to: 0); try await settle()
+    let beforeOpen = reader.presentedPage!.page
+    let archive = fixture.appendingPathComponent("images.zip")
+    reader.open(archive)
+    try require(reader.presentedPage?.sourceURL == folder && reader.presentedPage?.page == beforeOpen, "Opening another book cleared its predecessor early")
+    try await settle()
+    let archivePage = reader.presentedPage!.page
+    reader.move(.next); reader.cancelPageLoad(); try await settle()
+    try require(reader.presentedPage?.page == archivePage, "Cancelled archive preparation changed the visible frame")
+    reader.jump(to: 2); reader.jump(to: 0); try await settle()
+    try require(reader.presentedPage?.page.anchorIndex == 0, "Stale archive render replaced the latest jump")
+    reader.move(.next); reader.open(folder); try await settle()
+    try require(reader.presentedPage?.sourceURL == folder, "Archive render crossed a source boundary")
+    reader.shutdown()
+    try require(reader.presentedPage == nil && reader.decoded.isEmpty, "Shutdown retained the presented frame")
+    print("Page presentation smoke passed: retained frame, atomic spread, rapid jumps, resize, failures, archive cancellation/source switch\(verifyCanvas ? ", canvas pixel comparison" : "")")
 }
 
 // Intentionally ignore cancellation here, so stale timer completions exercise the session's generation guard.

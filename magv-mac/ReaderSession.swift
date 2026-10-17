@@ -2,10 +2,18 @@ import AppKit
 import MagvCore
 import Observation
 
+struct PresentedPage {
+    var sourceURL: URL
+    let page: DisplayPage
+    let images: [Int: DecodedImage]
+    let failureNames: [Int: String]
+}
+
 @MainActor @Observable final class ReaderSession {
     var source: LoadedSource?
     var page: DisplayPage?
-    var decoded: [Int: DecodedImage] = [:]
+    private(set) var presentedPage: PresentedPage?
+    var decoded: [Int: DecodedImage] { presentedPage?.images ?? [:] }
     var imageFailures: [Int: String] = [:]
     var isSlideshowPlaying = false
     private(set) var slideshowInterval = SlideshowInterval.initial
@@ -123,7 +131,7 @@ import Observation
                 let prepared = try await loaded.preparingPage(at: index, mode: self.mode)
                 guard !Task.isCancelled, self.requestID == id else { return }
                 self.cancelNavigation()
-                self.source = prepared; self.imageFailures = [:]; self.decoded = [:]
+                self.source = prepared; self.imageFailures = [:]
                 self.siblings = prepared.siblings; self.needsParentAccess = prepared.needsParentAccess
                 self.page = PageNavigator.page(at: index, orientations: prepared.images.map(\.orientation), mode: self.mode)
                 self.recentURLs.removeAll { $0 == loaded.url }; self.recentURLs.insert(loaded.url, at: 0)
@@ -281,6 +289,7 @@ import Observation
                 self.rememberPosition()
                 if !FileAccessService.sameLocation(newURL, source.url) {
                     self.source = source.relocated(to: newURL)
+                    if self.presentedPage?.sourceURL == source.url { self.presentedPage?.sourceURL = newURL }
                     if let renamed = self.source { await self.sourceCache.relocate(renamed, from: source.url) }
                     self.fileAccess.retain(newURL)
                     self.fileAccess.relocate(source.url, to: newURL)
@@ -399,7 +408,8 @@ import Observation
         guard let source, let page else { return }
         if page.visibleIndices.contains(source.images.count - 1) { stopSlideshow() }
         let indices = page.visibleIndices; let pixels = pixelSize
-        isDecoding = true; decoded = decoded.filter { indices.contains($0.key) }
+        // Keep the previous complete frame until every slot in this page is ready.
+        isDecoding = true
         renderTask = Task { [weak self, cache] in
             var result: [Int: DecodedImage] = [:]; var failures: [Int: String] = [:]
             for index in indices {
@@ -411,18 +421,22 @@ import Observation
             }
             withExtendedLifetime(source) {}
             guard !Task.isCancelled, let self, self.renderID == id else { return }
-            self.decoded = result; self.imageFailures.merge(failures) { _, new in new }; self.isDecoding = false
+            self.imageFailures.merge(failures) { _, new in new }
             if !failures.isEmpty {
                 self.stopSlideshow()
                 let revised = PageNavigator.page(at: page.anchorIndex, orientations: self.orientations, mode: self.mode, forceSingle: page.forceSingle)
                 if revised != self.page { self.page = revised; self.render(); return }
             }
+            self.presentedPage = PresentedPage(sourceURL: self.source?.url ?? source.url, page: page, images: result,
+                failureNames: Dictionary(uniqueKeysWithValues: failures.keys.map { ($0, source.images[$0].name) }))
+            self.isDecoding = false
             self.scheduleSlideshow(); self.prefetch()
         }
     }
 
     var canStartSlideshow: Bool {
         guard canRead, !isRendering, let source, let page,
+              presentedPage?.sourceURL == source.url, presentedPage?.page == page,
               !page.visibleIndices.contains(source.images.count - 1) else { return false }
         return page.visibleIndices.allSatisfy { decoded[$0] != nil && imageFailures[$0] == nil }
     }
@@ -453,7 +467,10 @@ import Observation
         }
     }
 
-    var canUseLoupe: Bool { loupeEnabled && canRead && !suppressPrefetch }
+    var canUseLoupe: Bool {
+        loupeEnabled && canRead && !isRendering && !suppressPrefetch &&
+        presentedPage?.sourceURL == source?.url && presentedPage?.page == page
+    }
     func requestLoupe(index: Int, displayedSize: CGSize, backingScale: CGFloat) {
         guard canUseLoupe, let source, page?.visibleIndices.contains(index) == true,
               let metadata = source.images[index].metadata else { if loupeIndex != nil { clearLoupe() }; return }
@@ -521,7 +538,7 @@ import Observation
         cancelOpen(); clearLoupe(); renderTask?.cancel(); isDecoding = false
     }
     func shutdown() {
-        closeWindow(); source = nil; decoded = [:]
+        closeWindow(); source = nil; presentedPage = nil
         Task { [cache, sourceCache] in await cache.removeAll(); await sourceCache.removeAll() }
         try? ExtractionStorage.shared(root: temporaryRoot).cleanOwnedAtExit()
     }

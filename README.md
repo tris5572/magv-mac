@@ -34,7 +34,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
   CODE_SIGNING_ALLOWED=NO build
 ```
 
-`test.sh` はコアのSwift Testingテストに加え、アプリ本体のReaderSession／InputRouterを使った非GUIスモークテストを実行します。`./scripts/test.sh --ui` では、画面セッションがあるMacで名前変更シートのAppKit入力・Return／変更ボタン・エラー後の再入力から実ファイルのリネームまでを追加検証します。Xcodeアプリのビルドとは別に実行してください。
+`test.sh` はコアのSwift Testingテストに加え、アプリ本体のReaderSession／InputRouterを使った非GUIスモークテストを実行します。`./scripts/test.sh --ui` では、画面セッションがあるMacで名前変更シートのAppKit入力・Return／変更ボタン・エラー後の再入力から実ファイルのリネームまでと、ページ移動中のキャンバスの描画維持をオフスクリーン画像比較で追加検証します。Xcodeアプリのビルドとは別に実行してください。
 
 `./scripts/benchmark.sh` は合成PNG 100枚、`./scripts/benchmark.sh --large` は2000×3000px・300枚・500MiB未満の合成JPEGとZIPでコア処理時間を測定します。全件展開する従来相当の経路とも比較します。実データには `./scripts/benchmark.sh --compare /path/to/book.zip` を使用できます。UI描画を含む体感速度の測定とは別です。
 

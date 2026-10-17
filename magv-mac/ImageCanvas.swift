@@ -6,7 +6,7 @@ struct ImageCanvas: NSViewRepresentable {
     let session: ReaderSession
     func makeNSView(context: Context) -> CanvasView { CanvasView(session: session) }
     func updateNSView(_ view: CanvasView, context: Context) {
-        _ = session.page; _ = session.decoded; _ = session.direction; _ = session.imageFailures
+        _ = session.page; _ = session.presentedPage; _ = session.direction
         _ = session.canUseLoupe; _ = session.loupeImage; _ = session.loupeIndex; _ = session.canRead
         view.setAccessibilityElement(true)
         view.setAccessibilityRole(.image)
@@ -50,15 +50,15 @@ struct ImageCanvas: NSViewRepresentable {
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor(white: 0.07, alpha: 1).setFill(); bounds.fill()
-        guard let page = session.page, let context = NSGraphicsContext.current?.cgContext else { return }
+        let presented = session.presentedPage
+        guard let page = presented?.page ?? session.page, let context = NSGraphicsContext.current?.cgContext else { return }
         var indices = page.visibleIndices
         if session.direction == .rightToLeft { indices.reverse() }
         let width = bounds.width / CGFloat(indices.count)
         for (position, index) in indices.enumerated() {
             let slot = NSRect(x: CGFloat(position) * width, y: 0, width: width, height: bounds.height)
-            guard let decoded = session.decoded[index] else {
-                let failed = session.imageFailures[index] != nil || session.source?.images[index].failure != nil
-                let message = failed ? "画像を読み込めません\n\(session.source?.images[index].name ?? "")" : "読み込み中…"
+            guard let decoded = presented?.images[index] else {
+                let message = presented?.failureNames[index].map { "画像を読み込めません\n\($0)" } ?? "読み込み中…"
                 let style = NSMutableParagraphStyle(); style.alignment = .center
                 (message as NSString).draw(in: NSRect(x: slot.minX + 16, y: slot.midY - 30, width: slot.width - 32, height: 100),
                     withAttributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
@@ -91,13 +91,14 @@ struct ImageCanvas: NSViewRepresentable {
         context.restoreGState()
     }
     private func hoveredImage() -> (Int, CGRect, CGPoint)? {
-        guard let window, window.isKeyWindow, let page = session.page else { return nil }
+        guard let window, window.isKeyWindow, let presented = session.presentedPage else { return nil }
+        let page = presented.page
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         guard bounds.contains(point), point.y >= 102 else { return nil }
         let indices = session.direction == .rightToLeft ? Array(page.visibleIndices.reversed()) : page.visibleIndices
         let width = bounds.width / CGFloat(indices.count)
         for (position, index) in indices.enumerated() {
-            guard let decoded = session.decoded[index] else { continue }
+            guard let decoded = presented.images[index] else { continue }
             let rect = CanvasGeometry.imageRect(size: CGSize(width: decoded.image.width, height: decoded.image.height),
                 slot: CGRect(x: CGFloat(position) * width, y: 0, width: width, height: bounds.height), position: position, count: indices.count)
             if rect.contains(point) { return (index, rect, point) }
