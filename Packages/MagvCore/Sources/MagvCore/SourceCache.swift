@@ -32,23 +32,24 @@ public actor SourceCache {
     public init(temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil, countLimit: Int = 3) {
         self.temporaryRoot = temporaryRoot; self.storage = storage; self.countLimit = max(1, countLimit)
     }
-    public func load(_ url: URL, prefetch: Bool = false,
+    public func load(_ url: URL, prefetch: Bool = false, initialIndex: Int = 0, mode: DisplayMode = .spread,
                      progress: @escaping @Sendable (String) -> Void = { _ in }) async throws -> LoadedSource {
         let key = try await Task.detached(priority: prefetch ? .utility : .userInitiated) { try SourceFingerprint.read(url) }.value
         try Task.checkCancellation()
+        if !prefetch { await cancelPrefetch(except: url); try Task.checkCancellation() }
         // A file replacement or directory edit invalidates the old extraction/list immediately.
         for old in values.keys where old.url == key.url && old != key { values[old] = nil }
         for old in pending.keys where old.url == key.url && old != key { pending.removeValue(forKey: old)?.task.cancel() }
         clock &+= 1
         if var value = values[key] {
             value.touched = clock; value.prefetched = value.prefetched && prefetch; values[key] = value
-            return value.source
+            progress("表示するページを準備中…")
+            return try await prepare(value.source, at: initialIndex, mode: mode, prefetch: prefetch)
         }
         let work: Pending
         if var existing = pending[key] {
             existing.prefetched = existing.prefetched && prefetch; pending[key] = existing; work = existing
         } else {
-            if !prefetch { cancelPrefetch() }
             let root = temporaryRoot; let storage = storage
             let task = Task.detached(priority: prefetch ? .utility : .userInitiated) {
                 try SourceLoader.load(url, temporaryRoot: root, storage: storage, progress: progress)
@@ -59,19 +60,20 @@ public actor SourceCache {
             let result = try await work.task.value
             if let current = pending[key], current.id == work.id {
                 pending[key] = nil; clock &+= 1
-                values[key] = Value(source: result, touched: clock, prefetched: current.prefetched)
+                values[key] = Value(source: result.unpinned(), touched: clock, prefetched: current.prefetched)
                 trim()
             }
             try Task.checkCancellation()
-            return result
+            progress("表示するページを準備中…")
+            return try await prepare(result, at: initialIndex, mode: mode, prefetch: prefetch)
         } catch {
             if pending[key]?.id == work.id { pending[key] = nil }
-            // Drop retained inactive sources on a full disk budget. The caller's current source stays alive.
-            if case ReaderError.limit(let name) = error, name.contains("キャッシュ全体"), !prefetch, evictOldest() {
-                return try await load(url, progress: progress)
-            }
             throw error
         }
+    }
+    private func prepare(_ source: LoadedSource, at index: Int, mode: DisplayMode, prefetch: Bool) async throws -> LoadedSource {
+        let anchor = min(max(0, index), max(0, source.images.count - 1))
+        return try await source.preparingPage(at: anchor, mode: mode, prefetch: prefetch)
     }
     private func trim() {
         while values.count > countLimit { if !evictOldest() { break } }
@@ -83,21 +85,26 @@ public actor SourceCache {
             }) else { return false }
         values[oldest.key] = nil; return true
     }
-    public func cancelPrefetch(except url: URL? = nil) {
+    public func cancelPrefetch(except url: URL? = nil) async {
         let keep = url?.resolvingSymlinksInPath().standardizedFileURL
         for key in pending.keys where pending[key]?.prefetched == true && key.url != keep { pending.removeValue(forKey: key)?.task.cancel() }
+        let archives = values.filter { $0.key.url != keep }.values.compactMap { $0.source.archive }
+        for archive in archives { await archive.cancelPrefetch() }
     }
-    public func cancelLoads(except url: URL? = nil) {
+    public func cancelLoads(except url: URL? = nil) async {
         let keep = url?.resolvingSymlinksInPath().standardizedFileURL
         for key in pending.keys where key.url != keep { pending.removeValue(forKey: key)?.task.cancel() }
+        let archives = values.filter { $0.key.url != keep }.values.compactMap { $0.source.archive }
+        for archive in archives { await archive.cancelAll() }
     }
     public func relocate(_ source: LoadedSource, from oldURL: URL) async {
+        await source.archive?.relocate(to: source.url)
         invalidate(oldURL); invalidate(source.url)
         guard let key = try? await Task.detached(operation: { try SourceFingerprint.read(source.url) }).value else { return }
-        clock &+= 1; values[key] = Value(source: source, touched: clock, prefetched: false); trim()
+        clock &+= 1; values[key] = Value(source: source.unpinned(), touched: clock, prefetched: false); trim()
     }
-    public func removePrefetched() {
-        cancelPrefetch()
+    public func removePrefetched() async {
+        await cancelPrefetch()
         values = values.filter { !$0.value.prefetched }
     }
     public func invalidate(_ url: URL) {
@@ -105,7 +112,9 @@ public actor SourceCache {
         for key in values.keys where key.url.path == path { values[key] = nil }
         for key in pending.keys where key.url.path == path { pending.removeValue(forKey: key)?.task.cancel() }
     }
-    public func removeAll() {
+    public func removeAll() async {
+        let archives = values.values.compactMap { $0.source.archive }
+        for archive in archives { await archive.cancelAll() }
         for work in pending.values { work.task.cancel() }
         pending.removeAll(); values.removeAll()
     }

@@ -93,7 +93,7 @@ private func aidTemporary() throws -> URL {
     }
     #expect(Set(paths).count == 1)
     let previous = try await cache.load(archive)
-    let size = try previous.images.reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
+    let size = try previous.images.prefix(2).reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
     #expect(storage.byteCount == size)
     // Atomic replacement with identical bytes/length still changes the inode and invalidates the key.
     try Data(contentsOf: archive).write(to: archive, options: .atomic)
@@ -131,7 +131,7 @@ private func aidTemporary() throws -> URL {
 @Test func fullDiskKeepsPinnedSourceAndFailedExtractionLeavesNoBytes() async throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let entries = try ArchiveReader.extract(aidFixture("images.zip"), into: root)
-    let size = try entries.reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
+    let size = try entries.prefix(2).reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
     let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: size + 1)
     let cache = SourceCache(storage: storage)
     let first = try await cache.load(aidFixture("images.zip"))
@@ -141,8 +141,9 @@ private func aidTemporary() throws -> URL {
     #expect(storage.byteCount == size)
     #expect(FileManager.default.fileExists(atPath: first.images[0].fileURL.path))
     let emptyStorage = try ExtractionStorage(root: root.appendingPathComponent("empty-cache"), capacity: 1)
-    #expect(throws: ReaderError.limit("一時ディスクキャッシュ全体2GiB")) {
-        _ = try SourceLoader.load(other, storage: emptyStorage)
+    let emptyCache = SourceCache(storage: emptyStorage)
+    await #expect(throws: ReaderError.limit("一時ディスクキャッシュ全体2GiB")) {
+        _ = try await emptyCache.load(other)
     }
     #expect(emptyStorage.byteCount == 0)
 }

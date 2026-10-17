@@ -95,7 +95,7 @@ public enum ArchiveReader {
         return entries.sorted { SourceFormat.naturalOrder($0.path, $1.path) }
     }
 
-    private static func error(_ reader: OpaquePointer) -> ReaderError {
+    static func error(_ reader: OpaquePointer) -> ReaderError {
         switch archive_errno(reader) {
         case EACCES, EPERM: return .permission
         case ENOENT: return .missing

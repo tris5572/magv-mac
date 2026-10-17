@@ -14,16 +14,18 @@ xcrun swiftc -O -parse-as-library -swift-version 6 -target arm64-apple-macos26.0
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" \
     -I "$BUILD_DIR" -I Packages/MagvCore/Vendor/CArchive.xcframework/macos-arm64/Headers \
     -L "$BUILD_DIR" -lMagvCore -larchive -lz -lbz2 -liconv scripts/benchmark.swift -o "$WORK_DIR/benchmark"
-if [ "$#" -gt 0 ]; then
+if [ "$#" -gt 0 ] && [ "$1" != "--large" ]; then
     "$WORK_DIR/benchmark" "$@"
 else
-    "$WORK_DIR/benchmark" --generate "$WORK_DIR/pages"
+    GENERATE_MODE="--generate"
+    if [ "${1:-}" = "--large" ]; then GENERATE_MODE="--generate-large"; fi
+    "$WORK_DIR/benchmark" "$GENERATE_MODE" "$WORK_DIR/pages"
     python3 - "$WORK_DIR/pages" "$WORK_DIR/synthetic.zip" <<'PY'
 import pathlib, sys, zipfile
 source = pathlib.Path(sys.argv[1])
 with zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED) as archive:
-    for page in source.glob('*.png'):
+    for page in source.iterdir():
         archive.write(page, page.name)
 PY
-    "$WORK_DIR/benchmark" "$WORK_DIR/pages" "$WORK_DIR/synthetic.zip"
+    "$WORK_DIR/benchmark" --compare "$WORK_DIR/pages" "$WORK_DIR/synthetic.zip"
 fi

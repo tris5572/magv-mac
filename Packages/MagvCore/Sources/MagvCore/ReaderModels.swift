@@ -27,6 +27,7 @@ public struct ImageMetadata: Sendable {
 public struct ImageEntry: Identifiable, Sendable {
     public let id: String
     public let name: String
+    // Archive files are available while the source returned by preparingImages is retained.
     public let fileURL: URL
     public var metadata: ImageMetadata?
     public var failure: String?
@@ -38,7 +39,7 @@ public enum SourceKind: Sendable { case archive, directory }
 public struct LoadedSource: Sendable {
     public let url: URL
     public let kind: SourceKind
-    public let images: [ImageEntry]
+    public internal(set) var images: [ImageEntry]
     public let initialIndex: Int?
     // Retains permission and temporary data for as long as the source is in use.
     public let access: FileAccessLease
@@ -48,13 +49,43 @@ public struct LoadedSource: Sendable {
     public let isPartialDirectory: Bool
     public let revision: FileRevision?
     public var title: String { url.lastPathComponent }
+    public let archive: ArchiveImageStore?
+    private var fileLeases: [ExtractionFileLease] = []
+
+    public func preparingMetadata(at indices: [Int], prefetch: Bool = false) async throws -> LoadedSource {
+        guard let archive else { return self }
+        let prepared = try await archive.prepare(indices, files: false, speculative: prefetch)
+        var result = self; result.images = prepared.images; return result
+    }
+    public func preparingImages(at indices: [Int], prefetch: Bool = false) async throws -> LoadedSource {
+        guard let archive else { return self }
+        let prepared = try await archive.prepare(indices, files: true, speculative: prefetch)
+        var result = self; result.images = prepared.images; result.fileLeases = prepared.leases; return result
+    }
+    public func preparingPage(at index: Int, mode: DisplayMode, prefetch: Bool = false) async throws -> LoadedSource {
+        guard !images.isEmpty, archive != nil else { return self }
+        let anchor = min(max(0, index), images.count - 1)
+        let first = try await preparingImages(at: [anchor], prefetch: prefetch)
+        guard mode == .spread, first.images[anchor].orientation == .portrait, anchor + 1 < images.count else { return first }
+        let pair = try await first.preparingImages(at: [anchor, anchor + 1], prefetch: prefetch)
+        return pair.images[anchor + 1].orientation == .portrait ? pair : try await pair.preparingImages(at: [anchor], prefetch: prefetch)
+    }
+    func unpinned() -> LoadedSource { var result = self; result.fileLeases = []; return result }
+    init(url: URL, kind: SourceKind, images: [ImageEntry], initialIndex: Int?, access: FileAccessLease,
+         temporaryDirectory: TemporaryDirectory?, siblings: [URL], needsParentAccess: Bool,
+         isPartialDirectory: Bool, revision: FileRevision?, archive: ArchiveImageStore? = nil) {
+        self.url = url; self.kind = kind; self.images = images; self.initialIndex = initialIndex; self.access = access
+        self.temporaryDirectory = temporaryDirectory; self.siblings = siblings; self.needsParentAccess = needsParentAccess
+        self.isPartialDirectory = isPartialDirectory; self.revision = revision; self.archive = archive
+    }
 
     public func relocated(to newURL: URL) -> LoadedSource {
-        LoadedSource(url: newURL, kind: kind, images: images, initialIndex: initialIndex, access: access,
+        var result = LoadedSource(url: newURL, kind: kind, images: images, initialIndex: initialIndex, access: access,
             temporaryDirectory: temporaryDirectory,
             siblings: siblings.map { FileAccessService.sameLocation($0, url) ? newURL : $0 }
                 .sorted { SourceFormat.naturalOrder($0.lastPathComponent, $1.lastPathComponent) },
-            needsParentAccess: needsParentAccess, isPartialDirectory: isPartialDirectory, revision: revision)
+            needsParentAccess: needsParentAccess, isPartialDirectory: isPartialDirectory, revision: revision, archive: archive)
+        result.fileLeases = fileLeases; return result
     }
 }
 
@@ -86,7 +117,7 @@ public enum ReaderError: Error, LocalizedError, Equatable, Sendable {
         case .limit(let name): "読み込み上限を超えました（\(name)）。"
         case .invalidImage(let name): "画像を読み込めません。\n\(name)"
         case .invalidName: "名前が空、または使用できない文字が含まれています。区切り文字や制御文字は使用できません。"
-        case .sourceChanged: "ファイルが外部で変更されています。もう一度開いてから名前を変更してください。"
+        case .sourceChanged: "ファイルが外部で変更されています。もう一度開いてください。"
         case .rename(let detail): "名前を変更できません。\n\(detail)"
         }
     }

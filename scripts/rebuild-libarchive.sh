@@ -14,6 +14,8 @@ fi
 printf '%s  %s\n' "$SHA256" "$TARBALL" | shasum -a 256 -c -
 tar -xf "$TARBALL" -C "$WORK_DIR"
 cd "$WORK_DIR/libarchive-$VERSION"
+patch -p1 < "$REPO_ROOT/Packages/MagvCore/Vendor/rar5-index-only.patch"
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 export CC="$(xcrun -f clang)"
 export CFLAGS="-arch arm64 -mmacosx-version-min=26.0 -O2"
 export LDFLAGS="-arch arm64 -mmacosx-version-min=26.0"

@@ -6,6 +6,7 @@ struct ContentView: View {
     @Bindable var session: ReaderSession
     let openPanel: () -> Void
     @State private var hoverControls = false
+    @State private var showPageLoading = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -65,6 +66,22 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }.clipped()
+                .overlay(alignment: .bottomTrailing) {
+                    if showPageLoading && !session.isLoading {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("ページを読み込み中…").font(.callout)
+                            Button("キャンセル") { session.cancelPageLoad() }
+                        }.padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)).padding(12)
+                    }
+                }
+                .task(id: session.isPreparingPage) {
+                    showPageLoading = false
+                    if session.isPreparingPage {
+                        do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
+                        if !Task.isCancelled { showPageLoading = true }
+                    }
+                }
             PageIndicator(session: session)
         }
         .preferredColorScheme(.dark)

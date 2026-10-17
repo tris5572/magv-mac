@@ -24,6 +24,13 @@ public final class ExtractionStorage: @unchecked Sendable {
     private let lock = NSLock()
     private var allocations: [URL: Int64] = [:]
     private var bytes: Int64 = 0
+    private struct FileRecord {
+        let url: URL; let directory: URL
+        var bytes: Int64 = 0; var pins = 1; var complete = false; var speculative: Bool
+        var touched: UInt64
+    }
+    private var files: [UUID: FileRecord] = [:]
+    private var clock: UInt64 = 0
     private static let marker = "magv-extraction-v1\n"
 
     public init(root: URL, capacity: Int64 = 2 * 1024 * 1024 * 1024) throws {
@@ -54,7 +61,7 @@ public final class ExtractionStorage: @unchecked Sendable {
     fileprivate func reserve(_ amount: Int64, for url: URL) throws {
         try lock.withLock {
             guard allocations[url] != nil else { throw CancellationError() }
-            guard amount >= 0, amount <= capacity - bytes else { throw ReaderError.limit("一時ディスクキャッシュ全体2GiB") }
+            try makeRoom(amount)
             allocations[url, default: 0] += amount; bytes += amount
         }
     }
@@ -62,6 +69,7 @@ public final class ExtractionStorage: @unchecked Sendable {
         lock.withLock {
             // Keep the process lock until removal finishes so a second instance cannot clean a live source.
             try? FileManager.default.removeItem(at: url)
+            files = files.filter { $0.value.directory != url }
             bytes -= allocations.removeValue(forKey: url) ?? 0
             flock(fd, LOCK_UN); close(fd)
         }
@@ -70,9 +78,64 @@ public final class ExtractionStorage: @unchecked Sendable {
     public func cleanOwnedAtExit() {
         lock.withLock {
             for url in allocations.keys { try? FileManager.default.removeItem(at: url) }
-            allocations.removeAll(); bytes = 0
+            files.removeAll(); allocations.removeAll(); bytes = 0
         }
     }
+    private func makeRoom(_ amount: Int64) throws {
+        guard amount >= 0, amount <= capacity else { throw ReaderError.limit("一時ディスクキャッシュ全体2GiB") }
+        while amount > capacity - bytes {
+            guard let victim = files.filter({ $0.value.complete && $0.value.pins == 0 }).min(by: {
+                if $0.value.speculative != $1.value.speculative { return $0.value.speculative }
+                return $0.value.touched < $1.value.touched
+            }) else { throw ReaderError.limit("一時ディスクキャッシュ全体2GiB") }
+            try deleteFile(victim.key)
+        }
+    }
+    private func deleteFile(_ id: UUID) throws {
+        guard let record = files[id] else { return }
+        if FileManager.default.fileExists(atPath: record.url.path) { try FileManager.default.removeItem(at: record.url) }
+        files[id] = nil; bytes -= record.bytes
+        if allocations[record.directory] != nil { allocations[record.directory, default: 0] -= record.bytes }
+    }
+    fileprivate func createFile(at url: URL, directory: TemporaryDirectory, speculative: Bool) throws -> ExtractionFileLease {
+        try lock.withLock {
+            guard allocations[directory.url] != nil else { throw CancellationError() }
+            let id = UUID(); clock &+= 1
+            guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw ReaderError.archive("一時ファイルを作成できません。") }
+            files[id] = FileRecord(url: url, directory: directory.url, speculative: speculative, touched: clock)
+            return ExtractionFileLease(id: id, url: url, directory: directory, storage: self)
+        }
+    }
+    fileprivate func pin(_ id: UUID, directory: TemporaryDirectory, speculative: Bool) -> ExtractionFileLease? {
+        lock.withLock {
+            guard var record = files[id], record.complete else { return nil }
+            guard FileManager.default.fileExists(atPath: record.url.path) else { try? deleteFile(id); return nil }
+            clock &+= 1; record.touched = clock; record.pins += 1
+            record.speculative = record.speculative && speculative; files[id] = record
+            return ExtractionFileLease(id: id, url: record.url, directory: directory, storage: self)
+        }
+    }
+    fileprivate func reserve(_ amount: Int64, file: UUID) throws {
+        try lock.withLock {
+            guard let directory = files[file]?.directory else { throw CancellationError() }
+            try makeRoom(amount)
+            files[file]!.bytes += amount; allocations[directory, default: 0] += amount; bytes += amount
+        }
+    }
+    fileprivate func seal(_ id: UUID) { lock.withLock { files[id]?.complete = true } }
+    fileprivate func unpin(_ id: UUID) {
+        lock.withLock {
+            guard files[id] != nil else { return }
+            files[id]!.pins -= 1
+            if files[id]!.pins == 0 && !files[id]!.complete { try? deleteFile(id) }
+        }
+    }
+    public func trimFiles(prefetchedOnly: Bool = false) {
+        lock.withLock {
+            for id in Array(files.keys) where files[id]!.pins == 0 && (!prefetchedOnly || files[id]!.speculative) { try? deleteFile(id) }
+        }
+    }
+    public var cachedFileCount: Int { lock.withLock { files.count } }
     public static func cleanOrphans(in root: URL) {
         guard let urls = try? FileManager.default.contentsOfDirectory(at: root,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
@@ -104,5 +167,23 @@ public final class TemporaryDirectory: @unchecked Sendable {
         (url, fd) = try storage.create()
     }
     public func reserve(_ amount: Int64) throws { try storage.reserve(amount, for: url) }
+    func createFile(at url: URL, speculative: Bool) throws -> ExtractionFileLease {
+        try storage.createFile(at: url, directory: self, speculative: speculative)
+    }
+    func file(_ id: UUID, speculative: Bool) -> ExtractionFileLease? { storage.pin(id, directory: self, speculative: speculative) }
     deinit { storage.release(url, fd: fd) }
+}
+
+/// A displayed page or decoder pins its file; only unpinned files are eligible for disk LRU eviction.
+public final class ExtractionFileLease: @unchecked Sendable {
+    let id: UUID
+    public let url: URL
+    private let directory: TemporaryDirectory
+    private let storage: ExtractionStorage
+    fileprivate init(id: UUID, url: URL, directory: TemporaryDirectory, storage: ExtractionStorage) {
+        self.id = id; self.url = url; self.directory = directory; self.storage = storage
+    }
+    func reserve(_ bytes: Int64) throws { try storage.reserve(bytes, file: id) }
+    func seal() { storage.seal(id) }
+    deinit { storage.unpin(id) }
 }

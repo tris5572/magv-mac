@@ -115,6 +115,7 @@ func rarUnicodeNames(_ name: String) throws {
 func encryptedArchivesAreRejected(_ name: String) throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     #expect(throws: ReaderError.encrypted) { try ArchiveReader.extract(fixture(name), into: dir, include: { _ in true }) }
+    #expect(throws: ReaderError.encrypted) { try ArchiveReader.index(fixture(name), include: { _ in true }) }
 }
 
 @Test func unsafePathsAndAppleMetadata() {
@@ -219,7 +220,8 @@ func compressedRAR4Payloads(_ name: String) throws {
         let loaded = try SourceLoader.load(fixture("images.zip"), temporaryRoot: dir)
         #expect(loaded.kind == .archive)
         #expect(loaded.images.count == 3)
-        #expect(loaded.images.allSatisfy { $0.metadata?.orientation == .portrait })
+        #expect(loaded.images.allSatisfy { $0.metadata == nil })
+        #expect(loaded.images.allSatisfy { !FileManager.default.fileExists(atPath: $0.fileURL.path) })
         let extractedDirectory = try #require(loaded.temporaryDirectory?.url)
         #expect(FileManager.default.fileExists(atPath: extractedDirectory.path))
         return extractedDirectory

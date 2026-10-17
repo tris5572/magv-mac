@@ -1,8 +1,9 @@
-# libarchive 3.8.10
+# libarchive 3.8.10 + Magv index-only patch
 
 - Upstream: https://github.com/libarchive/libarchive/releases/tag/v3.8.10
 - Source: https://www.libarchive.org/downloads/libarchive-3.8.10.tar.xz
 - SHA-256: `56cad765459d5ee25a3b761f90c47d99379d28297fbfb72d908880d6b875fb96`
+- Local patch: `rar5-index-only.patch` adds the opt-in `rar5:magv-index-only=1` header enumeration mode. It skips solid payloads without constructing the decompression dictionary, preserves header checks, and refuses data reads. Ordinary readers keep the upstream decoding and checksum path.
 - Build: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./scripts/rebuild-libarchive.sh`
 - Binary: static arm64, minimum macOS 26.0; Xcode/Apple clang, `-O2`.
 - Runtime dependencies: macOS system zlib, bz2, iconv, libc, CommonCrypto. No bundled executables, Homebrew libraries, JavaScript, WASM, or system libarchive.
@@ -12,4 +13,4 @@
 - RAR solid is verified for the RAR5 fixture. RAR4 solid and all real-world manga variants are not yet qualified.
 - License: `COPYING`; full source copyright notices also ship in the app's `ThirdPartyNotices.txt`.
 
-The checked-in XCFramework is ready for offline builds. `LIBARCHIVE_TARBALL=/path/to/libarchive-3.8.10.tar.xz` allows offline rebuilding after checksum verification. Intel slices are not included in this prototype.
+The checked-in XCFramework is ready for offline builds. `LIBARCHIVE_TARBALL=/path/to/libarchive-3.8.10.tar.xz` allows offline rebuilding after checksum verification and applying the checked-in patch. Intel slices are not included in this prototype.

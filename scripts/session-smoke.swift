@@ -1,5 +1,6 @@
 import AppKit
 import MagvCore
+import CArchive
 
 // Compiled with the actual app's ReaderSession and InputRouter by test.sh.
 @main struct SessionSmoke {
@@ -167,6 +168,7 @@ import MagvCore
         recentImageSession.open(folders[0], userSelection: false)
         while recentImageSession.isLoading || recentImageSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
         try require(recentImageSession.page?.anchorIndex == 3, "Recent image source reset to the originally selected image")
+        try await streamingNavigationSmoke(root: root, fixture: fixture)
         try await readingAidSmoke(root: root, fixture: fixture, folder: folders[0])
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
     }
@@ -308,4 +310,75 @@ private actor SlideshowGate {
     try require(reader.isEditingName && !reader.isSlideshowPlaying && reader.page?.anchorIndex == 0, "Rename didn't stop playback")
     reader.isEditingName = false; reader.stopSlideshow(); await gate.drain()
     reader.closeWindow()
+}
+
+@MainActor private func streamingNavigationSmoke(root: URL, fixture: URL) async throws {
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "StreamingSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    let portrait = try Data(contentsOf: fixture.appendingPathComponent("portrait.png"))
+    let landscape = try Data(contentsOf: fixture.appendingPathComponent("square.png"))
+    let orientations: [ImageOrientation] = [.portrait, .landscape, .portrait, .portrait, .landscape, .portrait, .portrait]
+    let url = root.appendingPathComponent("mixed-streaming.zip")
+    let writer = archive_write_new()!
+    archive_write_set_format_zip(writer)
+    try require(archive_write_open_filename(writer, url.path) == ARCHIVE_OK, "ZIP writer failed")
+    for index in orientations.indices.reversed() {
+        let entry = archive_entry_new()!
+        archive_entry_set_pathname_utf8(entry, "\(index + 1).png")
+        archive_entry_set_filetype(entry, 0o100000); archive_entry_set_perm(entry, 0o600)
+        let data = orientations[index] == .portrait ? portrait : landscape
+        archive_entry_set_size(entry, Int64(data.count))
+        try require(archive_write_header(writer, entry) == ARCHIVE_OK, "ZIP header failed")
+        let written = data.withUnsafeBytes { archive_write_data(writer, $0.baseAddress, $0.count) }
+        archive_entry_free(entry)
+        try require(written == data.count, "ZIP payload failed")
+    }
+    archive_write_close(writer); archive_write_free(writer)
+    let slideshow = SlideshowGate()
+    let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("stream-cache"), wait: { try await slideshow.wait($0) })
+    func settle() async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while reader.isLoading || reader.isRendering {
+            try require(ContinuousClock.now < deadline, "Streaming navigation timed out")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    reader.open(url); try await settle()
+    var expected = PageNavigator.page(at: 0, orientations: orientations, mode: .spread)
+    try require(reader.page == expected && reader.source?.images[6].metadata == nil, "Streaming open did not keep unvisited metadata lazy")
+    for command: PageCommand in [.last, .previous, .previous, .nextImage, .previousImage, .first, .next, .next, .next, .previous] {
+        expected = PageNavigator.move(command, from: expected, orientations: orientations, mode: .spread)
+        reader.move(command); try await settle()
+        try require(reader.page == expected, "Lazy metadata changed navigation semantics: \(command)")
+        try require(reader.page!.visibleIndices.allSatisfy { reader.decoded[$0] != nil }, "An unmaterialized page was decoded")
+    }
+    reader.jump(to: 0); try await settle()
+    expected = reader.page
+    for _ in 0..<3 {
+        expected = PageNavigator.move(.next, from: expected, orientations: orientations, mode: .spread)
+        reader.move(.next)
+    }
+    try await settle(); try require(reader.page == expected, "Rapid queued next-page commands were dropped or used unknown orientations")
+    reader.jump(to: 6); reader.jump(to: 2); reader.jump(to: 0); try await settle()
+    try require(reader.page?.anchorIndex == 0, "A stale direct jump replaced the latest target")
+    reader.jump(to: 6); reader.cancelPageLoad(); try await settle()
+    try require(reader.page?.anchorIndex == 0, "Cancelled page extraction changed the current spread")
+    reader.move(.last); reader.open(fixture.appendingPathComponent("images.zip")); try await settle()
+    try require(reader.source?.url == fixture.appendingPathComponent("images.zip") && reader.page?.anchorIndex == 0, "Old navigation crossed a source boundary")
+    reader.open(url); try await settle(); reader.jump(to: 0); try await settle()
+    reader.toggleSlideshow(); expected = reader.page
+    for tick in 1...4 {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await slideshow.count < tick {
+            try require(ContinuousClock.now < deadline, "Streaming slideshow failed to restart its wait")
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        expected = PageNavigator.move(.next, from: expected, orientations: orientations, mode: .spread)
+        await slideshow.fire(tick)
+        try await Task.sleep(for: .milliseconds(10)); try await settle()
+        try require(reader.page == expected, "Slideshow used incomplete archive metadata")
+    }
+    try require(!reader.isSlideshowPlaying && reader.page?.visibleIndices == [5, 6], "Streaming slideshow didn't stop at the final spread")
+    reader.closeWindow(); await slideshow.drain()
 }

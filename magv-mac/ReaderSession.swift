@@ -13,7 +13,9 @@ import Observation
     private(set) var loupeIndex: Int?
     private(set) var loupeImage: DecodedImage?
     var isLoading = false
-    var isRendering = false
+    private var isDecoding = false
+    private(set) var isPreparingPage = false
+    var isRendering: Bool { isDecoding || isPreparingPage }
     var isSelectingSource = false
     var isRenaming = false
     var isEditingName = false
@@ -56,6 +58,10 @@ import Observation
     private var positions: [URL: Int] = [:]
     private var openTask: Task<Void, Never>?
     private var renderTask: Task<Void, Never>?
+    private enum Navigation { case command(PageCommand), index(Int) }
+    private var navigationTask: Task<Void, Never>?
+    private var navigationID = UUID()
+    private var navigationQueue: [Navigation] = []
     private var neighborhoodTask: Task<Void, Never>?
     private var renameTask: Task<Void, Never>?
     private var deferredOpen: (url: URL, userSelection: Bool)?
@@ -79,7 +85,7 @@ import Observation
     }
     var title: String { source?.title ?? "magv" }
     var canRead: Bool { windowIsOpen && source != nil && !isLoading && !isRenaming && !isEditingName && !isEditingInterval && !isSelectingSource }
-    var canRename: Bool { canRead && source?.kind == .archive }
+    var canRename: Bool { canRead && !isPreparingPage && source?.kind == .archive }
     var searchURL: URL? { source.flatMap { SourceSearch.url(for: $0.url, kind: $0.kind) } }
     var pageLabel: String { guard let source, let page else { return "- / -" }; return "\(page.anchorIndex + 1) / \(source.images.count)" }
 
@@ -90,7 +96,7 @@ import Observation
 
     func open(_ url: URL, userSelection: Bool = true) {
         if isRenaming { deferredOpen = (url, userSelection); return }
-        stopSlideshow(); cancelPrefetch(exceptSource: url); clearLoupe()
+        stopSlideshow(); cancelNavigation(); cancelPrefetch(exceptSource: url); clearLoupe()
         willOpenSource?(); isEditingName = false; isEditingInterval = false
         fileAccess.retain(url, asDirectoryGrant: userSelection)
         let inputURL = userSelection ? url : fileAccess.reopeningURL(for: url)
@@ -104,17 +110,22 @@ import Observation
                 self.loadingMessage = message
             }
         }
+        let hint = positions[inputURL.resolvingSymlinksInPath().standardizedFileURL] ?? 0
         openTask = Task { [weak self, sourceCache] in
             await sourceCache.cancelLoads(except: inputURL)
             do {
-                let loaded = try await sourceCache.load(inputURL, progress: reportProgress)
+                let loaded = try await sourceCache.load(inputURL, initialIndex: hint, mode: self?.mode ?? .spread, progress: reportProgress)
                 try Task.checkCancellation()
                 guard let self, self.requestID == id else { return }
                 self.rememberPosition()
-                let index = (userSelection ? loaded.initialIndex : nil) ?? self.positions[loaded.url] ?? 0
-                self.source = loaded; self.imageFailures = [:]; self.decoded = [:]
-                self.siblings = loaded.siblings; self.needsParentAccess = loaded.needsParentAccess
-                self.page = PageNavigator.page(at: index, orientations: loaded.images.map(\.orientation), mode: self.mode)
+                let remembered = (userSelection ? loaded.initialIndex : nil) ?? self.positions[loaded.url] ?? 0
+                let index = min(max(0, remembered), loaded.images.count - 1)
+                let prepared = try await loaded.preparingPage(at: index, mode: self.mode)
+                guard !Task.isCancelled, self.requestID == id else { return }
+                self.cancelNavigation()
+                self.source = prepared; self.imageFailures = [:]; self.decoded = [:]
+                self.siblings = prepared.siblings; self.needsParentAccess = prepared.needsParentAccess
+                self.page = PageNavigator.page(at: index, orientations: prepared.images.map(\.orientation), mode: self.mode)
                 self.recentURLs.removeAll { $0 == loaded.url }; self.recentURLs.insert(loaded.url, at: 0)
                 self.recentURLs = Array(self.recentURLs.prefix(20))
                 self.fileAccess.remember(source: loaded.url, selected: inputURL)
@@ -135,7 +146,7 @@ import Observation
     }
 
     func cancelOpen() {
-        stopSlideshow(); cancelPrefetch()
+        stopSlideshow(); cancelNavigation(); cancelPrefetch()
         requestID = UUID(); openTask?.cancel(); neighborhoodTask?.cancel()
         Task { [sourceCache] in await sourceCache.cancelLoads() }
         isLoading = false; isSelectingSource = false
@@ -258,6 +269,7 @@ import Observation
               fileAccess.covers(source.url.deletingLastPathComponent()) else { completion(.failure(ReaderError.permission)); return }
         do { try FileAccessService.validateBaseName(baseName) } catch { completion(.failure(error)); return }
         stopSlideshow(); cancelPrefetch()
+        cancelNavigation()
         isRenaming = true
         renameTask = Task { [weak self] in
             let result = await Task.detached {
@@ -293,15 +305,77 @@ import Observation
 
     func move(_ command: PageCommand) {
         guard canRead else { return }
-        let next = PageNavigator.move(command, from: page, orientations: orientations, mode: mode)
-        guard next != page else { scheduleSlideshow(); return }
-        page = next; rememberPosition(); render(); hideCursor?()
+        if source?.archive == nil {
+            let next = PageNavigator.move(command, from: page, orientations: orientations, mode: mode)
+            guard next != page else { scheduleSlideshow(); return }
+            page = next; rememberPosition(); render(); hideCursor?(); return
+        }
+        enqueue(.command(command))
     }
 
     func jump(to index: Int) {
         guard canRead else { return }
-        page = PageNavigator.page(at: index, orientations: orientations, mode: mode)
-        rememberPosition(); render(); hideCursor?()
+        cancelNavigation()
+        if source?.archive == nil {
+            page = PageNavigator.page(at: index, orientations: orientations, mode: mode)
+            rememberPosition(); render(); hideCursor?(); return
+        }
+        enqueue(.index(index))
+    }
+
+    func cancelPageLoad() { stopSlideshow(); cancelNavigation() }
+    private func cancelNavigation() {
+        navigationID = UUID(); navigationTask?.cancel(); navigationTask = nil
+        navigationQueue.removeAll(); isPreparingPage = false
+    }
+    private func enqueue(_ request: Navigation) {
+        cancelSlideshowWait(); cancelPrefetch(); clearLoupe()
+        navigationQueue.append(request)
+        guard navigationTask == nil else { return }
+        let id = navigationID; isPreparingPage = true
+        navigationTask = Task { [weak self] in
+            while !Task.isCancelled, let self, self.navigationID == id, !self.navigationQueue.isEmpty {
+                let request = self.navigationQueue.removeFirst()
+                guard let current = self.source, let previous = self.page else { break }
+                do {
+                    let needed: [Int]
+                    switch request {
+                    case .index(let index):
+                        let anchor = min(max(0, index), current.images.count - 1); needed = self.mode == .spread ? [anchor, anchor + 1] : [anchor]
+                    case .command(let command):
+                        switch command {
+                        case .next: let next = (previous.visibleIndices.last ?? previous.anchorIndex) + 1; needed = self.mode == .spread ? [next, next + 1] : [next]
+                        case .nextImage: needed = self.mode == .spread ? [previous.anchorIndex + 1, previous.anchorIndex + 2] : [previous.anchorIndex + 1]
+                        case .previous: needed = self.mode == .spread ? [previous.anchorIndex - 2, previous.anchorIndex - 1, previous.anchorIndex] : [previous.anchorIndex - 1]
+                        case .previousImage: needed = self.mode == .spread ? [previous.anchorIndex - 1, previous.anchorIndex] : [previous.anchorIndex - 1]
+                        case .first: needed = self.mode == .spread ? [0, 1] : [0]
+                        case .last: needed = self.mode == .spread ? [current.images.count - 2, current.images.count - 1] : [current.images.count - 1]
+                        }
+                    }
+                    let metadata = try await current.preparingMetadata(at: needed)
+                    guard !Task.isCancelled, self.navigationID == id else { return }
+                    let orientations = metadata.images.enumerated().map { self.imageFailures[$0.offset] == nil ? $0.element.orientation : .unknown }
+                    let next: DisplayPage?
+                    switch request {
+                    case .index(let index): next = PageNavigator.page(at: index, orientations: orientations, mode: self.mode)
+                    case .command(let command): next = PageNavigator.move(command, from: previous, orientations: orientations, mode: self.mode)
+                    }
+                    guard let next else { continue }
+                    if case .command = request, next == previous { self.source = metadata; continue }
+                    let prepared = try await metadata.preparingImages(at: next.visibleIndices)
+                    guard !Task.isCancelled, self.navigationID == id else { return }
+                    self.source = prepared; self.page = next; self.rememberPosition(); self.render(); self.hideCursor?()
+                } catch is CancellationError { if Task.isCancelled { return } }
+                catch {
+                    guard !Task.isCancelled, self.navigationID == id else { return }
+                    self.navigationQueue.removeAll(); self.stopSlideshow()
+                    self.errorTitle = "ページを読み込めませんでした"; self.errorMessage = error.localizedDescription
+                }
+            }
+            guard let self, self.navigationID == id else { return }
+            self.navigationTask = nil; self.isPreparingPage = false
+            if !self.isDecoding { self.scheduleSlideshow(); self.prefetch() }
+        }
     }
 
     func updatePixelSize(_ size: Int) {
@@ -312,7 +386,10 @@ import Observation
     private func rememberPosition() { if let source, let page { positions[source.url] = page.anchorIndex } }
     private func recalculate() {
         guard let page else { return }
-        self.page = PageNavigator.page(at: page.anchorIndex, orientations: orientations, mode: mode); render()
+        cancelNavigation()
+        if source?.archive == nil {
+            self.page = PageNavigator.page(at: page.anchorIndex, orientations: orientations, mode: mode); render()
+        } else { enqueue(.index(page.anchorIndex)) }
     }
 
     private func render() {
@@ -322,18 +399,19 @@ import Observation
         guard let source, let page else { return }
         if page.visibleIndices.contains(source.images.count - 1) { stopSlideshow() }
         let indices = page.visibleIndices; let pixels = pixelSize
-        isRendering = true; decoded = decoded.filter { indices.contains($0.key) }
+        isDecoding = true; decoded = decoded.filter { indices.contains($0.key) }
         renderTask = Task { [weak self, cache] in
             var result: [Int: DecodedImage] = [:]; var failures: [Int: String] = [:]
             for index in indices {
                 guard !Task.isCancelled else { return }
                 let entry = source.images[index]
                 if let failure = entry.failure { failures[index] = failure; continue }
-                do { result[index] = try await cache.image(at: entry.fileURL, maxPixelSize: pixels) }
+                do { result[index] = try await cache.image(at: entry.fileURL, maxPixelSize: pixels, retaining: source) }
                 catch { failures[index] = error.localizedDescription }
             }
+            withExtendedLifetime(source) {}
             guard !Task.isCancelled, let self, self.renderID == id else { return }
-            self.decoded = result; self.imageFailures.merge(failures) { _, new in new }; self.isRendering = false
+            self.decoded = result; self.imageFailures.merge(failures) { _, new in new }; self.isDecoding = false
             if !failures.isEmpty {
                 self.stopSlideshow()
                 let revised = PageNavigator.page(at: page.anchorIndex, orientations: self.orientations, mode: self.mode, forceSingle: page.forceSingle)
@@ -364,7 +442,7 @@ import Observation
     func resumeSlideshow() { slideshowSuspended = false; scheduleSlideshow() }
     private func scheduleSlideshow() {
         cancelSlideshowWait()
-        guard isSlideshowPlaying, !isEditingInterval else { return }
+        guard isSlideshowPlaying, !isEditingInterval, !isPreparingPage else { return }
         guard canStartSlideshow else { if !isRendering { stopSlideshow() }; return }
         guard !slideshowSuspended else { return }
         let id = slideshowID; let delay = Duration.seconds(slideshowInterval)
@@ -383,9 +461,10 @@ import Observation
         guard loupeIndex != index || loupePixels != pixels else { return }
         clearLoupe(); loupeIndex = index; loupePixels = pixels
         let id = loupeID; let entry = source.images[index]
-        loupeTask = Task { [weak self, cache] in
-            guard let image = try? await cache.image(at: entry.fileURL, maxPixelSize: pixels, use: .loupe),
-                  !Task.isCancelled, let self, self.loupeID == id else { return }
+        loupeTask = Task { [weak self, cache, source] in
+            let image = try? await cache.image(at: entry.fileURL, maxPixelSize: pixels, use: .loupe, retaining: source)
+            withExtendedLifetime(source) {}
+            guard let image, !Task.isCancelled, let self, self.loupeID == id else { return }
             self.loupeImage = image
         }
     }
@@ -409,23 +488,28 @@ import Observation
         prefetchTask = Task { [weak self, cache, sourceCache] in
             for index in nearby {
                 guard !Task.isCancelled, self?.renderID == id else { return }
-                _ = try? await cache.image(at: source.images[index].fileURL, maxPixelSize: pixels, use: .prefetch)
+                guard let prepared = try? await source.preparingImages(at: [index], prefetch: true), !Task.isCancelled else { return }
+                _ = try? await cache.image(at: prepared.images[index].fileURL, maxPixelSize: pixels, use: .prefetch, retaining: prepared)
+                withExtendedLifetime(prepared) {}
             }
             for url in adjacent {
                 guard !Task.isCancelled, self?.renderID == id else { return }
-                guard let neighbor = try? await sourceCache.load(url, prefetch: true) else { continue }
+                guard let neighbor = try? await sourceCache.load(url, prefetch: true, mode: mode) else { continue }
                 guard !Task.isCancelled, self?.renderID == id else { return }
                 let first = PageNavigator.page(at: 0, orientations: neighbor.images.map(\.orientation), mode: mode)
                 for index in first?.visibleIndices ?? [] {
                     guard !Task.isCancelled else { return }
-                    _ = try? await cache.image(at: neighbor.images[index].fileURL, maxPixelSize: pixels, use: .prefetch)
+                    _ = try? await cache.image(at: neighbor.images[index].fileURL, maxPixelSize: pixels, use: .prefetch, retaining: neighbor)
                 }
+                withExtendedLifetime(neighbor) {}
             }
         }
     }
     func handleMemoryPressure(critical: Bool) {
         suppressPrefetch = true; cancelPrefetch(); clearLoupe()
+        let root = temporaryRoot
         Task { [cache, sourceCache] in
+            try? ExtractionStorage.shared(root: root).trimFiles(prefetchedOnly: !critical)
             await cache.memoryPressure(critical: critical)
             if critical { await sourceCache.removeAll() } else { await sourceCache.removePrefetched() }
         }
@@ -434,7 +518,7 @@ import Observation
     func resumeWindow() { windowIsOpen = true; if source != nil { render() } }
     func closeWindow() {
         stopSlideshow(); windowIsOpen = false; isEditingInterval = false
-        cancelOpen(); clearLoupe(); renderTask?.cancel(); isRendering = false
+        cancelOpen(); clearLoupe(); renderTask?.cancel(); isDecoding = false
     }
     func shutdown() {
         closeWindow(); source = nil; decoded = [:]

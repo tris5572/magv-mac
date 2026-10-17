@@ -16,7 +16,6 @@ public enum SourceLoader {
             let files: [(String, URL)]
             var initialIndex: Int?
             var partialDirectory = false
-            var revision: FileRevision?
             if values.isDirectory == true {
                 sourceURL = URL(fileURLWithPath: url.path, isDirectory: true)
                 kind = .directory
@@ -25,12 +24,14 @@ public enum SourceLoader {
             } else if SourceFormat.archiveExtensions.contains(url.pathExtension.lowercased()) {
                 sourceURL = url
                 kind = .archive
-                revision = try FileRevision.read(url)
+                progress("画像の一覧を確認中…")
+                let index = try ArchiveReader.index(url, limits: limits)
+                guard !index.members.isEmpty else { throw ReaderError.noImages }
                 let directory = try TemporaryDirectory(storage: storage ?? ExtractionStorage.shared(root: temporaryRoot))
-                temporary = directory
-                files = try ArchiveReader.extract(url, into: directory.url, limits: limits, reserveBytes: directory.reserve, progress: { count in
-                    progress("画像を展開中… \(count)枚")
-                }).map { ($0.path, $0.fileURL) }
+                let images = ArchiveImageStore(url: url, index: index, directory: directory, access: access, limits: limits)
+                let siblings = try? FileAccessService.siblings(of: url, kind: .archive)
+                return LoadedSource(url: url, kind: .archive, images: images.initialEntries, initialIndex: nil, access: access, temporaryDirectory: directory, siblings: siblings ?? [url],
+                needsParentAccess: siblings == nil, isPartialDirectory: false, revision: index.revision, archive: images)
             } else if SourceFormat.isImage(url.lastPathComponent) {
                 sourceURL = url.deletingLastPathComponent()
                 kind = .directory
@@ -57,11 +58,10 @@ public enum SourceLoader {
                 } catch { failure = error.localizedDescription }
                 images.append(ImageEntry(id: file.0, name: file.0, fileURL: file.1, metadata: metadata, failure: failure))
             }
-            if let revision, try FileRevision.read(sourceURL) != revision { throw ReaderError.sourceChanged }
             let siblings = try? FileAccessService.siblings(of: sourceURL, kind: kind)
             return LoadedSource(url: sourceURL, kind: kind, images: images, initialIndex: initialIndex,
                 access: access, temporaryDirectory: temporary, siblings: siblings ?? [sourceURL],
-                needsParentAccess: siblings == nil, isPartialDirectory: partialDirectory, revision: revision)
+                needsParentAccess: siblings == nil, isPartialDirectory: partialDirectory, revision: nil)
         } catch let error as CocoaError {
             switch error.code {
             case .fileReadNoPermission: throw ReaderError.permission

@@ -4,12 +4,17 @@ public enum ImageUse: Int, Sendable { case prefetch, loupe, display }
 
 /// A single decoder drains visible work before speculative work; all callers of a key share it.
 public actor ImageCache {
-    private struct Key: Hashable { let url: URL; let revision: FileRevision; let pixels: Int; let highResolution: Bool }
+    private struct Key: Hashable, Sendable { let url: URL; let revision: FileRevision; let pixels: Int; let highResolution: Bool }
     private struct Value { let image: DecodedImage; var touched: UInt64; var use: ImageUse }
+    private struct Waiter {
+        let continuation: CheckedContinuation<DecodedImage, Error>
+        let owner: LoadedSource?
+        let use: ImageUse
+    }
     private struct Pending {
         let id: UUID; let order: UInt64
-        var use: ImageUse
-        var waiters: [CheckedContinuation<DecodedImage, Error>]
+        var waiters: [UUID: Waiter]
+        var use: ImageUse { waiters.values.max { $0.use.rawValue < $1.use.rawValue }?.use ?? .prefetch }
     }
     private var values: [Key: Value] = [:]
     private var pending: [Key: Pending] = [:]
@@ -19,11 +24,18 @@ public actor ImageCache {
     private var highResolutionBytes = 0
     private let capacity: Int
     private let loupeCapacity: Int
+    typealias Decode = @Sendable (URL, Int, Int) throws -> DecodedImage
+    private let decode: Decode
     public init(capacity: Int = 256 * 1024 * 1024, loupeCapacity: Int = 64 * 1024 * 1024) {
         self.capacity = max(0, capacity); self.loupeCapacity = min(max(0, capacity), max(0, loupeCapacity))
+        decode = { try ImageDecoder.decode(at: $0, maxPixelSize: $1, maximumBytes: $2) }
+    }
+    init(decoder: @escaping Decode) {
+        capacity = 256 * 1024 * 1024; loupeCapacity = 64 * 1024 * 1024; decode = decoder
     }
 
-    public func image(at url: URL, maxPixelSize: Int, use: ImageUse = .display) async throws -> DecodedImage {
+    /// Retains archive file leases through actual decoding, even if a prefetch waiter is cancelled early.
+    public func image(at url: URL, maxPixelSize: Int, use: ImageUse = .display, retaining source: LoadedSource? = nil) async throws -> DecodedImage {
         try Task.checkCancellation()
         let key = Key(url: url.standardizedFileURL, revision: try FileRevision.read(url),
                       pixels: max(1, min(maxPixelSize, 8192)), highResolution: use == .loupe)
@@ -34,16 +46,28 @@ public actor ImageCache {
             values[key] = value
             return value.image
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            if var work = pending[key] {
-                work.waiters.append(continuation)
-                if use.rawValue > work.use.rawValue { work.use = use }
-                pending[key] = work
-            } else {
-                pending[key] = Pending(id: UUID(), order: clock, use: use, waiters: [continuation])
+        let consumer = UUID()
+        let result: DecodedImage = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                let waiter = Waiter(continuation: continuation, owner: source, use: use)
+                if var work = pending[key] {
+                    work.waiters[consumer] = waiter; pending[key] = work
+                } else {
+                    pending[key] = Pending(id: UUID(), order: clock, waiters: [consumer: waiter])
+                }
+                startNext()
             }
-            startNext()
+        } onCancel: {
+            Task { await self.cancelWaiter(key, consumer: consumer) }
         }
+        try Task.checkCancellation()
+        return result
+    }
+    private func cancelWaiter(_ key: Key, consumer: UUID) {
+        guard var work = pending[key], let waiter = work.waiters.removeValue(forKey: consumer) else { return }
+        pending[key] = work.waiters.isEmpty ? nil : work
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
     private func startNext() {
@@ -53,13 +77,13 @@ public actor ImageCache {
         }) else { return }
         let key = next.key; let id = next.value.id
         active = id
-        Task.detached(priority: next.value.use == .prefetch ? .utility : .userInitiated) {
-            let result = Result {
-                let image = try ImageDecoder.decode(at: key.url, maxPixelSize: key.pixels,
-                    maximumBytes: key.highResolution ? 64 * 1024 * 1024 : 128 * 1024 * 1024)
+        let owners = next.value.waiters.values.compactMap(\.owner)
+        Task.detached(priority: next.value.use == .prefetch ? .utility : .userInitiated) { [decode] in
+            let result = withExtendedLifetime(owners) { Result {
+                let image = try decode(key.url, key.pixels, key.highResolution ? 64 * 1024 * 1024 : 128 * 1024 * 1024)
                 guard try FileRevision.read(key.url) == key.revision else { throw ReaderError.sourceChanged }
                 return image
-            }
+            } }
             await self.finish(key, id: id, result: result)
         }
     }
@@ -83,7 +107,7 @@ public actor ImageCache {
                     if key.highResolution { highResolutionBytes += image.byteCount } else { bytes += image.byteCount }
                 }
             }
-            for waiter in work.waiters { waiter.resume(with: result) }
+            for waiter in work.waiters.values { waiter.continuation.resume(with: result) }
         }
         startNext()
     }
@@ -93,21 +117,23 @@ public actor ImageCache {
     }
     public func cancelPrefetch() {
         for key in pending.keys where pending[key]?.use == .prefetch {
-            if let work = pending.removeValue(forKey: key) { for waiter in work.waiters { waiter.resume(throwing: CancellationError()) } }
+            if let work = pending.removeValue(forKey: key) { for waiter in work.waiters.values { waiter.continuation.resume(throwing: CancellationError()) } }
         }
     }
     public func memoryPressure(critical: Bool) {
         cancelPrefetch()
         for key in pending.keys where key.highResolution {
-            if let work = pending.removeValue(forKey: key) { for waiter in work.waiters { waiter.resume(throwing: CancellationError()) } }
+            if let work = pending.removeValue(forKey: key) { for waiter in work.waiters.values { waiter.continuation.resume(throwing: CancellationError()) } }
         }
         for key in values.keys where values[key]?.use == .prefetch { remove(key) }
         for key in values.keys where key.highResolution { remove(key) }
         if critical { for key in Array(values.keys) { remove(key) } }
     }
     public func removeAll() {
-        for work in pending.values { for waiter in work.waiters { waiter.resume(throwing: CancellationError()) } }
+        for work in pending.values { for waiter in work.waiters.values { waiter.continuation.resume(throwing: CancellationError()) } }
         pending.removeAll(); values.removeAll(); bytes = 0; highResolutionBytes = 0
     }
+    var isDecoding: Bool { active != nil }
+    var pendingRequestCount: Int { pending.values.reduce(0) { $0 + $1.waiters.count } }
     public var byteCounts: (display: Int, loupe: Int) { (bytes, highResolutionBytes) }
 }
