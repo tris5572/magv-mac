@@ -82,8 +82,11 @@ import MagvCore
 
     @objc private func confirm() {
         guard submitButton.isEnabled, !editor.hasMarkedText(), !editor.isCommittingComposition else { return }
+        // Return can arrive before the field editor commits its text to the control.
+        let baseName = nameField.currentEditor()?.string ?? nameField.stringValue
+        nameField.stringValue = baseName
         setBusy(true); errorLabel.stringValue = ""
-        submit(nameField.stringValue) { [weak self] result in
+        submit(baseName) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success: self.dismiss()

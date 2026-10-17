@@ -18,4 +18,4 @@ xcrun swiftc -disable-sandbox -parse-as-library -swift-version 6 -target arm64-a
     magv-mac/ReaderPreferencesStore.swift magv-mac/ReaderSession.swift magv-mac/InputRouter.swift \
     magv-mac/RenameSheetController.swift scripts/session-smoke.swift \
     -o "$WORK_DIR/session-smoke"
-"$WORK_DIR/session-smoke" "$REPO_ROOT/Packages/MagvCore/Tests/MagvCoreTests/Fixtures"
+"$WORK_DIR/session-smoke" "$REPO_ROOT/Packages/MagvCore/Tests/MagvCoreTests/Fixtures" "$@"

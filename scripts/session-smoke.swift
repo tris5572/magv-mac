@@ -171,7 +171,86 @@ import CArchive
         try await streamingNavigationSmoke(root: root, fixture: fixture)
         try await readingAidSmoke(root: root, fixture: fixture, folder: folders[0])
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
+        if CommandLine.arguments.contains("--ui") { try await renameSheetSmoke(root: root, fixture: fixture) }
     }
+}
+
+// Opt-in: exercises AppKit's actual field editor and sheet without showing a reader window.
+@MainActor private func renameSheetSmoke(root: URL, fixture: URL) async throws {
+    _ = NSApplication.shared
+    let directory = root.appendingPathComponent("rename-sheet", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let original = directory.appendingPathComponent("original.a.ZIP")
+    let bytes = try Data(contentsOf: fixture.appendingPathComponent("images.zip"))
+    try bytes.write(to: original)
+    let session = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: directory.appendingPathComponent("cache"))
+    defer { session.shutdown() }
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "RenameSheetSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    func settle(_ ready: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !ready() {
+            try require(ContinuousClock.now < deadline, "Rename sheet timed out")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    session.open(original)
+    try await settle { !session.isLoading && !session.isRendering }
+    try require(session.source?.url == original, "Rename fixture did not open")
+    session.authorizeDirectory(directory)
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    defer { window.close() }
+    func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+    func exercise(button: Bool, attempts: [(String, Bool)]) async throws {
+        guard let source = session.source else { throw ReaderError.missing }
+        var submitted: String?
+        var result: Result<Void, Error>?
+        var finished = false
+        session.isEditingName = true
+        let sheet = RenameSheetController(source: source, previous: nil, next: nil, submit: { name, completion in
+            submitted = name
+            session.renameArchive(to: name) { value in result = value; completion(value) }
+        }, finished: { finished = true; session.isEditingName = false })
+        sheet.present(on: window)
+        defer { sheet.dismiss() }
+        let views = descendants(sheet.panel.contentView!)
+        guard let field = views.compactMap({ $0 as? NSTextField }).first(where: \.isEditable),
+              let change = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == "変更" }),
+              let editor = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing field editor") }
+        editor.setMarkedText("未確定", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+        editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        try require(submitted == nil && !finished, "IME composition submitted a rename")
+        editor.unmarkText()
+        for (name, succeeds) in attempts {
+            submitted = nil; result = nil
+            let oldURL = session.source!.url
+            let oldPage = session.page
+            sheet.panel.makeFirstResponder(field)
+            guard let active = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing retry editor") }
+            active.insertText(name, replacementRange: NSRange(location: 0, length: active.string.utf16.count))
+            if button { change.performClick(nil) }
+            else { active.doCommand(by: #selector(NSResponder.insertNewline(_:))) }
+            try await settle { result != nil }
+            try require(submitted == name, "Rename submitted stale field text")
+            switch result! {
+            case .success:
+                try require(succeeds && finished, "Invalid name was accepted or sheet did not close")
+                let newURL = directory.appendingPathComponent(name).appendingPathExtension(oldURL.pathExtension)
+                try require(!FileManager.default.fileExists(atPath: oldURL.path), "Original file still exists after rename")
+                try require(try Data(contentsOf: newURL) == bytes, "Renamed file is missing or changed")
+                try require(session.source?.url == newURL && session.title == newURL.lastPathComponent && session.page == oldPage,
+                            "Rename sheet lost reader identity or page")
+            case .failure:
+                try require(!succeeds && !finished && field.isEnabled && field.stringValue == name, "Failed rename lost the edited name")
+                try require(session.source?.url == oldURL && (try Data(contentsOf: oldURL)) == bytes, "Failed rename changed the file")
+            }
+        }
+    }
+    try await exercise(button: false, attempts: [("日本語 a.b", true)])
+    try await exercise(button: true, attempts: [("invalid/name", false), ("変更ボタンで確定", true)])
+    print("Rename sheet smoke passed: active field editor, Return/button, invalid-name retry, IME guard, on-disk rename")
 }
 
 // Intentionally ignore cancellation here, so stale timer completions exercise the session's generation guard.
