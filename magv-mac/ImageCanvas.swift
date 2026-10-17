@@ -122,15 +122,16 @@ struct ImageCanvas: NSViewRepresentable {
 
     override func scrollWheel(with event: NSEvent) {
         guard event.momentumPhase.isEmpty, abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX), session.canRead else { return }
+        // AppKit applies the system scroll direction; a negative delta scrolls down.
         let now = event.timestamp
         if event.hasPreciseScrollingDeltas {
             if event.phase.contains(.began) || now - lastWheelTime > 0.35 { wheelAmount = 0; wheelTurned = false }
             lastWheelTime = now
             guard !wheelTurned else { return }
             wheelAmount += event.scrollingDeltaY
-            if abs(wheelAmount) >= 24 { session.move(wheelAmount > 0 ? .next : .previous); wheelTurned = true }
+            if abs(wheelAmount) >= 24 { session.move(wheelAmount < 0 ? .next : .previous); wheelTurned = true }
         } else if now - lastWheelTime > 0.12 {
-            lastWheelTime = now; session.move(event.scrollingDeltaY > 0 ? .next : .previous)
+            lastWheelTime = now; session.move(event.scrollingDeltaY < 0 ? .next : .previous)
         }
     }
 
