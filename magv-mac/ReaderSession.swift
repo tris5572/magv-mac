@@ -64,6 +64,9 @@ struct PresentedPage {
     private var suppressPrefetch = false
     private var windowIsOpen = true
     private var positions: [URL: Int] = [:]
+    private struct ArchiveNeighbors { let previous: URL?; let next: URL? }
+    // Each successful open captures its own neighbors, independently of earlier renames.
+    private var archiveNeighbors: ArchiveNeighbors?
     private var openTask: Task<Void, Never>?
     private var renderTask: Task<Void, Never>?
     private enum Navigation { case command(PageCommand), index(Int) }
@@ -129,10 +132,14 @@ struct PresentedPage {
                 let remembered = (userSelection ? loaded.initialIndex : nil) ?? self.positions[loaded.url] ?? 0
                 let index = min(max(0, remembered), loaded.images.count - 1)
                 let prepared = try await loaded.preparingPage(at: index, mode: self.mode)
+                // A prefetched/cached source may contain a directory listing from before a rename.
+                let urls = prepared.kind == .archive
+                    ? try? await Task.detached { try FileAccessService.siblings(of: prepared.url, kind: prepared.kind) }.value
+                    : (prepared.needsParentAccess ? nil : prepared.siblings)
                 guard !Task.isCancelled, self.requestID == id else { return }
                 self.cancelNavigation()
                 self.source = prepared; self.imageFailures = [:]
-                self.siblings = prepared.siblings; self.needsParentAccess = prepared.needsParentAccess
+                self.archiveNeighbors = nil; self.updateNeighborhood(urls, for: prepared)
                 self.page = PageNavigator.page(at: index, orientations: prepared.images.map(\.orientation), mode: self.mode)
                 self.recentURLs.removeAll { $0 == loaded.url }; self.recentURLs.insert(loaded.url, at: 0)
                 self.recentURLs = Array(self.recentURLs.prefix(20))
@@ -164,7 +171,20 @@ struct PresentedPage {
     func canSwitch(_ command: SourceCommand) -> Bool {
         guard canRead, !needsParentAccess, let source else { return false }
         if command == .random { return siblings.contains { !FileAccessService.sameLocation($0, source.url) } }
-        return SourceNavigator.destination(command, current: source.url, siblings: siblings) != nil
+        guard let destination = sourceDestination(command) else { return false }
+        return siblings.contains { FileAccessService.sameLocation($0, destination) }
+    }
+
+    func sourceDestination(_ command: SourceCommand) -> URL? {
+        guard let source else { return nil }
+        if source.kind == .archive, let archiveNeighbors {
+            switch command {
+            case .previous: return archiveNeighbors.previous
+            case .next: return archiveNeighbors.next
+            case .random: break
+            }
+        }
+        return SourceNavigator.destination(command, current: source.url, siblings: siblings)
     }
 
     func switchSource(_ command: SourceCommand) {
@@ -175,23 +195,32 @@ struct PresentedPage {
             authorizeParent { [weak self] in self?.switchSource(command) }
             return
         }
-        let planned = SourceNavigator.destination(command, current: source.url, siblings: siblings)
+        let planned = sourceDestination(command)
         let id = requestID
         neighborhoodTask?.cancel(); isSelectingSource = true
         neighborhoodTask = Task { [weak self] in
             do {
                 let urls = try await Task.detached { try FileAccessService.siblings(of: source.url, kind: source.kind) }.value
                 guard !Task.isCancelled, let self, self.requestID == id else { return }
-                self.siblings = urls; self.isSelectingSource = false
+                self.updateNeighborhood(urls, for: source); self.isSelectingSource = false
                 if command != .random, let planned, !urls.contains(where: { FileAccessService.sameLocation($0, planned) }) {
                     self.errorMessage = "\(planned.lastPathComponent)が見つかりません。兄弟ソースの一覧を更新しました。"; return
                 }
-                if let next = SourceNavigator.destination(command, current: source.url, siblings: urls) { self.open(next, userSelection: false) }
+                if let next = self.sourceDestination(command) { self.open(next, userSelection: false) }
             } catch {
                 guard !Task.isCancelled, let self, self.requestID == id else { return }
                 self.isSelectingSource = false; self.needsParentAccess = true
                 self.errorMessage = "同階層のソースを確認できません。\n\(error.localizedDescription)"
             }
+        }
+    }
+
+    private func updateNeighborhood(_ urls: [URL]?, for source: LoadedSource) {
+        siblings = urls ?? [source.url]; needsParentAccess = urls == nil
+        if source.kind == .archive, archiveNeighbors == nil, let urls {
+            archiveNeighbors = ArchiveNeighbors(
+                previous: SourceNavigator.destination(.previous, current: source.url, siblings: urls),
+                next: SourceNavigator.destination(.next, current: source.url, siblings: urls))
         }
     }
 
@@ -239,7 +268,7 @@ struct PresentedPage {
         neighborhoodTask = Task { [weak self] in
             let urls = try? await Task.detached { try FileAccessService.siblings(of: source.url, kind: source.kind) }.value
             guard !Task.isCancelled, let self, self.requestID == id, self.source?.url == source.url else { return }
-            self.siblings = urls ?? [source.url]; self.needsParentAccess = urls == nil
+            self.updateNeighborhood(urls, for: source)
             self.prefetch()
         }
     }
@@ -254,7 +283,7 @@ struct PresentedPage {
             self.neighborhoodTask = Task { [weak self] in
                 let urls = try? await Task.detached { try FileAccessService.siblings(of: source.url, kind: source.kind) }.value
                 guard !Task.isCancelled, let self, self.requestID == id else { return }
-                self.siblings = urls ?? [source.url]; self.isSelectingSource = false
+                self.updateNeighborhood(urls, for: source); self.isSelectingSource = false
                 self.isEditingName = true; NSCursor.setHiddenUntilMouseMoves(false); self.showRenameEditor?()
             }
         }
@@ -499,8 +528,7 @@ struct PresentedPage {
         let nearby = Set(page.visibleIndices.flatMap { [$0 - 2, $0 - 1, $0 + 1, $0 + 2] })
             .filter { source.images.indices.contains($0) && !page.visibleIndices.contains($0) }
             .sorted { abs($0 - page.anchorIndex) < abs($1 - page.anchorIndex) }
-        let adjacent = [SourceNavigator.destination(.next, current: source.url, siblings: siblings),
-                        SourceNavigator.destination(.previous, current: source.url, siblings: siblings)]
+        let adjacent = [sourceDestination(.next), sourceDestination(.previous)]
             .compactMap { $0 }.filter { fileAccess.covers($0) }
         prefetchTask = Task { [weak self, cache, sourceCache] in
             for index in nearby {
@@ -538,7 +566,7 @@ struct PresentedPage {
         cancelOpen(); clearLoupe(); renderTask?.cancel(); isDecoding = false
     }
     func shutdown() {
-        closeWindow(); source = nil; presentedPage = nil
+        closeWindow(); source = nil; presentedPage = nil; archiveNeighbors = nil
         Task { [cache, sourceCache] in await cache.removeAll(); await sourceCache.removeAll() }
         try? ExtractionStorage.shared(root: temporaryRoot).cleanOwnedAtExit()
     }

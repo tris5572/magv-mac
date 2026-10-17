@@ -171,8 +171,8 @@ import UniformTypeIdentifiers
     private func presentRenameSheet() {
         showReader()
         guard let window = readerWindow, window.attachedSheet == nil, let source = session.source else { session.isEditingName = false; return }
-        let previous = SourceNavigator.destination(.previous, current: source.url, siblings: session.siblings)?.lastPathComponent
-        let next = SourceNavigator.destination(.next, current: source.url, siblings: session.siblings)?.lastPathComponent
+        let previous = session.sourceDestination(.previous)?.lastPathComponent
+        let next = session.sourceDestination(.next)?.lastPathComponent
         let sheet = RenameSheetController(source: source, previous: previous, next: next,
             submit: { [weak self] name, completion in self?.session.renameArchive(to: name, completion: completion) },
             finished: { [weak self] in self?.session.isEditingName = false; self?.renameSheet = nil })

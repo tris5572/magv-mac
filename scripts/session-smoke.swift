@@ -172,9 +172,102 @@ import ImageIO
         try await streamingNavigationSmoke(root: root, fixture: fixture)
         try await readingAidSmoke(root: root, fixture: fixture, folder: folders[0])
         try await pagePresentationSmoke(root: root, fixture: fixture, verifyCanvas: CommandLine.arguments.contains("--ui"))
+        try await renameNavigationSmoke(root: root, fixture: fixture)
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
         if CommandLine.arguments.contains("--ui") { try await renameSheetSmoke(root: root, fixture: fixture) }
     }
+}
+
+@MainActor private func renameNavigationSmoke(root: URL, fixture: URL) async throws {
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "RenameNavigationSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    let directory = root.appendingPathComponent("rename-order", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let data = try Data(contentsOf: fixture.appendingPathComponent("images.zip"))
+    let books = [1, 2, 10, 20].map { directory.appendingPathComponent("book\($0).zip") }
+    for book in books { try data.write(to: book) }
+    let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("rename-order-cache"))
+    defer { reader.shutdown() }
+    func waitUntil(_ ready: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !ready() {
+            try require(ContinuousClock.now < deadline, "Rename navigation timed out")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    func settle() async throws {
+        try await waitUntil { !reader.isLoading && !reader.isRendering && !reader.isSelectingSource && !reader.isRenaming }
+    }
+    func neighbor(_ command: SourceCommand) -> URL? {
+        reader.sourceDestination(command)
+    }
+    func rename(_ name: String) async throws -> URL {
+        let result: Result<Void, Error> = await withCheckedContinuation { continuation in
+            reader.renameArchive(to: name) { continuation.resume(returning: $0) }
+        }
+        try result.get(); try await settle()
+        return reader.source!.url
+    }
+    // Cache B before renaming A, so opening B must refresh even a cached source's neighbors.
+    reader.open(books[2]); try await settle(); reader.authorizeDirectory(directory)
+    reader.open(books[1]); try await settle()
+    _ = try await rename("zz-moved")
+    try require(neighbor(.previous) == books[0] && neighbor(.next) == books[2], "Rename changed the neighbors captured when A opened")
+    let collision = try await rename("book10")
+    try require(collision.lastPathComponent == "book10_.zip" && neighbor(.next) == books[2], "Collision suffix changed the captured next archive")
+    _ = try await rename("00-first")
+    reader.addBangPrefix(); try await settle()
+    let prefixed = reader.source!.url
+    try require(prefixed.lastPathComponent == "!00-first.zip" && neighbor(.previous) == books[0] && neighbor(.next) == books[2],
+                "Repeated rename or bang prefix replaced the open-time neighbors")
+    let failed: Result<Void, Error> = await withCheckedContinuation { continuation in
+        reader.renameArchive(to: "invalid/name") { continuation.resume(returning: $0) }
+    }
+    if case .success = failed { throw ReaderError.invalidName }
+    try require(reader.source?.url == prefixed && neighbor(.next) == books[2], "Failed rename changed the captured next archive")
+    reader.beginRename(); try await settle()
+    try require(reader.isEditingName && neighbor(.previous) == books[0] && neighbor(.next) == books[2], "Rename editor replaced the captured neighbors")
+    reader.isEditingName = false
+    let inserted = directory.appendingPathComponent("book3.zip")
+    try data.write(to: inserted); reader.refreshNeighborhood()
+    try await waitUntil { reader.siblings.contains(inserted) }
+    try require(neighbor(.next) == books[2], "Folder refresh replaced an open-time neighbor with an inserted archive")
+    try FileManager.default.removeItem(at: inserted)
+    reader.refreshNeighborhood(); try await waitUntil { !reader.siblings.contains(inserted) }
+    reader.open(directory.appendingPathComponent("missing.zip")); try await settle()
+    try require(reader.source?.url == prefixed && neighbor(.previous) == books[0] && neighbor(.next) == books[2], "Failed open replaced the current archive's captured neighbors")
+    reader.errorMessage = nil
+    reader.switchSource(.next); try await settle()
+    try require(reader.source?.url == books[2] && neighbor(.previous) == books[0], "B reused the cached directory order from before A's rename")
+    reader.switchSource(.previous); try await settle()
+    try require(reader.source?.url == books[0], "A → rename → B → previous returned to renamed A instead of A's predecessor")
+    reader.open(prefixed); try await settle()
+    try require(!reader.canSwitch(.previous) && neighbor(.next) == books[0], "Explicit reopen did not capture neighbors from the actual new name")
+    let movedToEnd = try await rename("zz-moved")
+    try require(!reader.canSwitch(.previous) && neighbor(.next) == books[0], "Renaming an archive opened at the start changed its neighbors")
+    reader.switchSource(.next); try await settle()
+    try require(reader.source?.url == books[0] && !reader.canSwitch(.previous), "Newly opened archive inherited the previous archive's neighbors")
+    reader.open(movedToEnd); try await settle()
+    try require(!reader.canSwitch(.next) && neighbor(.previous) == books[3], "Reopened last archive retained an older snapshot")
+    _ = try await rename("00-first")
+    try require(!reader.canSwitch(.next) && neighbor(.previous) == books[3], "Renaming the last archive created a next neighbor")
+    reader.switchSource(.previous); try await settle()
+    try require(reader.source?.url == books[3] && !reader.canSwitch(.next), "Previous target inherited the renamed archive's obsolete position")
+    reader.open(books[2]); try await settle()
+    try FileManager.default.removeItem(at: books[3])
+    reader.switchSource(.next); try await settle()
+    try require(reader.source?.url == books[2] && reader.errorMessage != nil && !reader.canSwitch(.next), "Deleted captured neighbor was silently replaced")
+    reader.errorMessage = nil
+    let appended = directory.appendingPathComponent("book30.zip")
+    try data.write(to: appended); reader.refreshNeighborhood()
+    try await waitUntil { reader.siblings.contains(appended) }
+    try require(neighbor(.next) == books[3] && !reader.canSwitch(.next), "Refresh substituted a new archive for the deleted captured neighbor")
+    reader.open(books[2]); try await settle()
+    try require(neighbor(.next) == appended, "Reopening a cached archive did not refresh its neighbors")
+    reader.switchSource(.next); try await settle()
+    try require(reader.source?.url == appended, "Freshly captured next archive was not opened")
+    print("Rename navigation smoke passed: A → rename → B → A's predecessor, fresh cached opens, per-open neighbors, repeated rename/bang/collision, refresh, additions/deletions, first/last")
 }
 
 // Opt-in: exercises AppKit's actual field editor and sheet without showing a reader window.

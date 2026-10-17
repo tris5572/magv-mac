@@ -35,6 +35,21 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     for _ in 0..<30 { #expect(SourceNavigator.destination(.random, current: urls[1], siblings: urls) != urls[1]) }
 }
 
+@Test func siblingURLsKeepTheirIdentityAfterRename() throws {
+    let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+    let directory = root.appendingPathComponent("books", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    _ = try write("book1.zip", in: directory)
+    let source = try write("book2.zip", in: directory).resolvingSymlinksInPath().standardizedFileURL
+    let siblings = try FileAccessService.siblings(of: source, kind: .archive)
+    #expect(siblings.contains(source))
+    let renamed = try FileAccessService.renameArchive(at: source, baseName: "zz-renamed")
+    let relocated = siblings.map { FileAccessService.sameLocation($0, source) ? renamed : $0 }
+    #expect(relocated.contains(renamed))
+    #expect(!relocated.contains(source))
+    #expect(try FileAccessService.siblings(of: renamed, kind: .archive).contains(renamed))
+}
+
 @Test func renamePreservesExtensionContentAndAvoidsCollisions() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let source = try write("a.b.ZIP", in: root, content: "original bytes")

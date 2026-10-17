@@ -63,7 +63,9 @@ public enum FileAccessService {
             if !urls.contains(where: { sameLocation($0, source) }),
                let values = try? source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey]),
                (kind == .archive ? values.isRegularFile == true : values.isDirectory == true) { urls.append(source) }
-            return urls.sorted { SourceFormat.naturalOrder($0.lastPathComponent, $1.lastPathComponent) }
+            // Match SourceLoader's URL form before a rename makes the old path nonexistent.
+            return urls.map { $0.resolvingSymlinksInPath().standardizedFileURL }
+                .sorted { SourceFormat.naturalOrder($0.lastPathComponent, $1.lastPathComponent) }
         } catch let error as CocoaError where error.code == .fileReadNoPermission { throw ReaderError.permission }
     }
 
