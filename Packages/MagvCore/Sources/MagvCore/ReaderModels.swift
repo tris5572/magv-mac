@@ -1,11 +1,13 @@
 import Foundation
 
+// 表示方法、開き方向、移動操作を共通の型で表し、UIとコア処理で共有する。
 public enum DisplayMode: String, CaseIterable, Codable, Sendable { case single, spread }
 public enum ReadingDirection: String, CaseIterable, Codable, Sendable { case rightToLeft, leftToRight }
 public enum ImageOrientation: Sendable { case portrait, landscape, unknown }
 public enum PageCommand: CaseIterable, Sendable { case next, previous, nextImage, previousImage, first, last }
 public enum SourceCommand: CaseIterable, Sendable { case next, previous, random }
 
+/// 0始まりの基準画像番号と、実際に表示する1枚または2枚の画像番号。
 public struct DisplayPage: Equatable, Sendable {
     public let anchorIndex: Int
     public let visibleIndices: [Int]
@@ -24,10 +26,11 @@ public struct ImageMetadata: Sendable {
     public var orientation: ImageOrientation { width < height ? .portrait : .landscape }
 }
 
+/// 画像一覧の1項目。未調査の画像はmetadataがnil、読み込み失敗はfailureに記録する。
 public struct ImageEntry: Identifiable, Sendable {
     public let id: String
     public let name: String
-    // Archive files are available while the source returned by preparingImages is retained.
+    // アーカイブ内画像の実体は、preparingImagesが返したソースを保持している間だけ保証される。
     public let fileURL: URL
     public var metadata: ImageMetadata?
     public var failure: String?
@@ -36,12 +39,13 @@ public struct ImageEntry: Identifiable, Sendable {
 
 public enum SourceKind: Sendable { case archive, directory }
 
+/// 本の一覧情報とアクセス権・一時領域を共有する値。必要な画像を準備したコピーを返す。
 public struct LoadedSource: Sendable {
     public let url: URL
     public let kind: SourceKind
     public internal(set) var images: [ImageEntry]
     public let initialIndex: Int?
-    // Retains permission and temporary data for as long as the source is in use.
+    // ソースが利用されている間、アクセス権と一時展開データの所有権を保持する。
     public let access: FileAccessLease
     public let temporaryDirectory: TemporaryDirectory?
     public let siblings: [URL]
@@ -52,16 +56,19 @@ public struct LoadedSource: Sendable {
     public let archive: ArchiveImageStore?
     private var fileLeases: [ExtractionFileLease] = []
 
+    /// 見開き判定に必要な画像情報を取得する。取得後のファイル保持は要求しない。
     public func preparingMetadata(at indices: [Int], prefetch: Bool = false) async throws -> LoadedSource {
         guard let archive else { return self }
         let prepared = try await archive.prepare(indices, files: false, speculative: prefetch)
         var result = self; result.images = prepared.images; return result
     }
+    /// 指定画像のファイルを準備し、返したソースが保持されている間は削除から保護する。
     public func preparingImages(at indices: [Int], prefetch: Bool = false) async throws -> LoadedSource {
         guard let archive else { return self }
         let prepared = try await archive.prepare(indices, files: true, speculative: prefetch)
         var result = self; result.images = prepared.images; result.fileLeases = prepared.leases; return result
     }
+    /// 先頭候補を確認してから必要な2枚目を準備し、横長や単体表示では余分な展開を避ける。
     public func preparingPage(at index: Int, mode: DisplayMode, prefetch: Bool = false) async throws -> LoadedSource {
         guard !images.isEmpty, archive != nil else { return self }
         let anchor = min(max(0, index), images.count - 1)
@@ -70,6 +77,7 @@ public struct LoadedSource: Sendable {
         let pair = try await first.preparingImages(at: [anchor, anchor + 1], prefetch: prefetch)
         return pair.images[anchor + 1].orientation == .portrait ? pair : try await pair.preparingImages(at: [anchor], prefetch: prefetch)
     }
+    // 一覧キャッシュは画像ファイルを固定せず、容量不足時にページ単位で削除できるようにする。
     func unpinned() -> LoadedSource { var result = self; result.fileLeases = []; return result }
     init(url: URL, kind: SourceKind, images: [ImageEntry], initialIndex: Int?, access: FileAccessLease,
          temporaryDirectory: TemporaryDirectory?, siblings: [URL], needsParentAccess: Bool,
@@ -89,6 +97,7 @@ public struct LoadedSource: Sendable {
     }
 }
 
+/// 破損データや過大な展開から資源を守る上限。ソース累積量と一時ディスク量を分ける。
 public struct ReaderLimits: Sendable {
     public var entryCount = 100_000
     public var imageBytes: Int64 = 256 * 1024 * 1024
@@ -98,6 +107,7 @@ public struct ReaderLimits: Sendable {
     public init() {}
 }
 
+/// 各処理のエラーを、画面に表示できる日本語メッセージへまとめる。
 public enum ReaderError: Error, LocalizedError, Equatable, Sendable {
     case unsupported, noImages, missing, permission
     case archive(String), encrypted, unsupportedCompression(String), unsafePath(String)
@@ -129,6 +139,7 @@ public enum SourceFormat {
     public static func isImage(_ name: String) -> Bool {
         imageExtensions.contains((name as NSString).pathExtension.lowercased())
     }
+    // 数字を自然順で比較し、同値ならUTF-8順で揃えて並びを安定させる。
     public static func naturalOrder(_ lhs: String, _ rhs: String) -> Bool {
         let comparison = lhs.localizedStandardCompare(rhs)
         return comparison == .orderedSame ? lhs.utf8.lexicographicallyPrecedes(rhs.utf8) : comparison == .orderedAscending

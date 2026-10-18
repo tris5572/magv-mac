@@ -2,10 +2,12 @@ import AppKit
 import SwiftUI
 import MagvCore
 
+/// SwiftUIの状態監視と、AppKitによる描画・マウス入力を橋渡しする。
 struct ImageCanvas: NSViewRepresentable {
     let session: ReaderSession
     func makeNSView(context: Context) -> CanvasView { CanvasView(session: session) }
     func updateNSView(_ view: CanvasView, context: Context) {
+        // 描画に使う状態をここで読み取り、Observationの変更監視対象に含める。
         _ = session.page; _ = session.presentedPage; _ = session.direction
         _ = session.canUseLoupe; _ = session.loupeImage; _ = session.loupeIndex; _ = session.canRead
         view.setAccessibilityElement(true)
@@ -17,11 +19,13 @@ struct ImageCanvas: NSViewRepresentable {
     }
 }
 
+/// ページ画像を描画し、ルーペ・ホイール・コンテキストメニューを処理する。
 @MainActor final class CanvasView: NSView {
     let session: ReaderSession
     private var wheelAmount: CGFloat = 0
     private var wheelTurned = false
     private var lastWheelTime: TimeInterval = 0
+    // 配置計算を左上原点に統一し、画像そのものを描くときだけ上下を反転する。
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
@@ -50,6 +54,7 @@ struct ImageCanvas: NSViewRepresentable {
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor(white: 0.07, alpha: 1).setFill(); bounds.fill()
+        // 読み込み途中の新しいページではなく、準備済みのページと画像を一組で描画する。
         let presented = session.presentedPage
         guard let page = presented?.page ?? session.page, let context = NSGraphicsContext.current?.cgContext else { return }
         var indices = page.visibleIndices
@@ -68,6 +73,7 @@ struct ImageCanvas: NSViewRepresentable {
             let rect = CanvasGeometry.imageRect(size: CGSize(width: image.width, height: image.height), slot: slot, position: position, count: indices.count)
             drawImage(image, in: rect, context: context)
         }
+        // レンズの内側だけ拡大画像を描き、取得中は通常解像度の画像を代用する。
         if let (index, rect, pointer) = hoveredImage(), session.canUseLoupe,
            let preview = session.decoded[index] {
             let lens = CGRect(x: pointer.x - 300, y: pointer.y - 300, width: 600, height: 600)
@@ -90,6 +96,7 @@ struct ImageCanvas: NSViewRepresentable {
         context.draw(image, in: CGRect(origin: .zero, size: rect.size))
         context.restoreGState()
     }
+    // 余白や上部パネルを除き、実際に描画した画像矩形の中だけをルーペ対象にする。
     private func hoveredImage() -> (Int, CGRect, CGPoint)? {
         guard let window, window.isKeyWindow, let presented = session.presentedPage else { return nil }
         let page = presented.page
@@ -123,8 +130,9 @@ struct ImageCanvas: NSViewRepresentable {
 
     override func scrollWheel(with event: NSEvent) {
         guard event.momentumPhase.isEmpty, abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX), session.canRead else { return }
-        // AppKit applies the system scroll direction; a negative delta scrolls down.
+        // AppKitがシステムのスクロール方向を反映済みで、負の差分は下方向を表す。
         let now = event.timestamp
+        // トラックパッドは移動量を積算して1ジェスチャー1回、通常ホイールは時間で抑制する。
         if event.hasPreciseScrollingDeltas {
             if event.phase.contains(.began) || now - lastWheelTime > 0.35 { wheelAmount = 0; wheelTurned = false }
             lastWheelTime = now

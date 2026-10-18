@@ -1,9 +1,11 @@
 import Foundation
 
+/// rawValueが大きい用途ほど優先する。通常表示をルーペや先読みより先にデコードする。
 public enum ImageUse: Int, Sendable { case prefetch, loupe, display }
 
-/// A single decoder drains visible work before speculative work; all callers of a key share it.
+/// 1つのデコーダーで表示要求を先読みより優先し、同じキーへの要求は処理を共有する。
 public actor ImageCache {
+    // 更新情報と要求解像度もキーに含め、変更前の画像や別サイズの結果と混同しない。
     private struct Key: Hashable, Sendable { let url: URL; let revision: FileRevision; let pixels: Int; let highResolution: Bool }
     private struct Value { let image: DecodedImage; var touched: UInt64; var use: ImageUse }
     private struct Waiter {
@@ -34,7 +36,7 @@ public actor ImageCache {
         capacity = 256 * 1024 * 1024; loupeCapacity = 64 * 1024 * 1024; decode = decoder
     }
 
-    /// Retains archive file leases through actual decoding, even if a prefetch waiter is cancelled early.
+    /// 先読みの待機が途中でキャンセルされても、実際のデコード完了までは展開ファイルを保持する。
     public func image(at url: URL, maxPixelSize: Int, use: ImageUse = .display, retaining source: LoadedSource? = nil) async throws -> DecodedImage {
         try Task.checkCancellation()
         let key = Key(url: url.standardizedFileURL, revision: try FileRevision.read(url),
@@ -66,12 +68,13 @@ public actor ImageCache {
     }
     private func cancelWaiter(_ key: Key, consumer: UUID) {
         guard var work = pending[key], let waiter = work.waiters.removeValue(forKey: consumer) else { return }
-        // Image I/O cannot stop an active decode. Keep it shareable across a page turn,
-        // even when the prefetch consumer leaves before the display consumer arrives.
+        // Image I/Oの実行中デコードは中断できないため、ページ移動をまたいで共有可能に保つ。
+        // 先読み要求の離脱後に表示要求が到着しても、同じ処理を利用できる。
         pending[key] = work.waiters.isEmpty && work.id != active ? nil : work
         waiter.continuation.resume(throwing: CancellationError())
     }
 
+    // 実際のデコードは一度に1件。用途の優先度が同じなら要求の古いものから処理する。
     private func startNext() {
         guard active == nil, let next = pending.max(by: {
             if $0.value.use != $1.value.use { return $0.value.use.rawValue < $1.value.use.rawValue }
@@ -89,6 +92,7 @@ public actor ImageCache {
             await self.finish(key, id: id, result: result)
         }
     }
+    // 有効な要求だけをキャッシュへ反映し、同じ画像を待つ全利用者へ結果を配る。
     private func finish(_ key: Key, id: UUID, result: Result<DecodedImage, Error>) {
         if active == id { active = nil }
         if let work = pending[key], work.id == id {
@@ -99,6 +103,7 @@ public actor ImageCache {
                           let oldest = values.filter({ $0.key.highResolution }).min(by: { $0.value.touched < $1.value.touched }) {
                         remove(oldest.key)
                     }
+                    // ルーペ用の上限に加え、通常表示とルーペを合わせた総量も上限内に収める。
                     while bytes + highResolutionBytes + image.byteCount > capacity,
                           let oldest = values.min(by: {
                             if $0.value.use == .prefetch && $1.value.use != .prefetch { return true }
@@ -129,6 +134,7 @@ public actor ImageCache {
             for waiter in waiters { waiter.continuation.resume(throwing: CancellationError()) }
         }
     }
+    /// 先読み・ルーペを優先して破棄し、深刻なメモリ不足では通常表示のキャッシュも解放する。
     public func memoryPressure(critical: Bool) {
         cancelPrefetch(keepingActive: false)
         for key in pending.keys where key.highResolution {

@@ -3,6 +3,7 @@ import SwiftUI
 import MagvCore
 import UniformTypeIdentifiers
 
+/// AppKitのイベントループを起動する入口。ウィンドウ内の画面にはSwiftUIを使う。
 @main @MainActor struct MagvMacApp {
     static func main() {
         let app = NSApplication.shared
@@ -15,6 +16,7 @@ import UniformTypeIdentifiers
     }
 }
 
+/// アプリの起動・終了、ウィンドウ、メニュー、OSからの通知を閲覧セッションへ接続する。
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let preferences = ReaderPreferencesStore()
     lazy var session = ReaderSession(preferences: preferences)
@@ -42,6 +44,7 @@ import UniformTypeIdentifiers
             NSCursor.setHiddenUntilMouseMoves(true)
         }
         showReader()
+        // 入力欄やシートが操作中ならキーを奪わず、キャンバス上の閲覧操作だけを扱う。
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.window === self.readerWindow, self.readerWindow?.attachedSheet == nil,
                   !(self.readerWindow?.firstResponder is NSTextView),
@@ -60,6 +63,7 @@ import UniformTypeIdentifiers
         let workspace = NSWorkspace.shared.notificationCenter
         workspace.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
         workspace.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+        // OSのメモリ圧迫通知に応じて、セッションの先読みとキャッシュ量を制御する。
         let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
         pressure.setEventHandler { [weak self, weak pressure] in
             guard let self, let pressure else { return }
@@ -68,7 +72,7 @@ import UniformTypeIdentifiers
             else if pressure.data.contains(.normal) { self.session.memoryPressureEnded() }
         }
         memoryPressure = pressure; pressure.resume()
-        // Recovery is limited to marked, unlocked directories in the native app's dedicated cache.
+        // 起動時の回収は、専用キャッシュ内で所有マーカーがあり、ロックされていない領域に限定する。
         _ = try? ExtractionStorage.shared()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -117,6 +121,7 @@ import UniformTypeIdentifiers
         let main = NSScreen.main
         return NSScreen.screens.sorted { $0 === main && $1 !== main }.map(\.visibleFrame)
     }
+    // フルスクリーンへの遷移中の寸法を通常ウィンドウの保存値に混ぜない。
     private func saveWindowFrame(_ window: NSWindow) {
         guard window === readerWindow, !transitioningFullScreen, !window.styleMask.contains(.fullScreen) else { return }
         preferences.setWindowFrame(window.frame)
@@ -127,6 +132,7 @@ import UniformTypeIdentifiers
         window.setFrame(frame, display: true); saveWindowFrame(window)
     }
 
+    // 既存のウィンドウを再利用し、新規作成時だけ保存済みの位置とサイズを復元する。
     private func showReader() {
         if let readerWindow { readerWindow.makeKeyAndOrderFront(nil); return }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
@@ -154,6 +160,7 @@ import UniformTypeIdentifiers
         }
     }
 
+    // フォルダ選択をシートで提示する。選択先の妥当性と権限保持はセッション側で扱う。
     private func requestDirectoryAccess(_ directory: URL, reason: String, completion: @escaping (URL?) -> Void) {
         showReader(); NSCursor.setHiddenUntilMouseMoves(false)
         guard let window = readerWindow, window.attachedSheet == nil else { completion(nil); return }
@@ -196,6 +203,7 @@ import UniformTypeIdentifiers
     }
     @objc private func editInterval(_ sender: Any?) { showReader(); session.isEditingInterval = true }
 
+    // メニュー項目に操作と型付きの値を持たせ、実行時にセッションへ渡す。
     private func buildMenus() {
         let main = NSMenu()
         func submenu(_ name: String) -> NSMenu {
@@ -269,6 +277,7 @@ import UniformTypeIdentifiers
         NSApp.mainMenu = main
     }
 
+    // メニューを開く直前に履歴・チェック状態・再生表示を現在の閲覧状態へ同期する。
     func menuNeedsUpdate(_ menu: NSMenu) {
         NSCursor.setHiddenUntilMouseMoves(false)
         if menu === recentMenu {
@@ -291,6 +300,7 @@ import UniformTypeIdentifiers
             if let direction = item.representedObject as? ReadingDirection { item.state = direction == session.direction ? .on : .off }
         }
     }
+    // 操作可能かどうかはセッションの判定を使い、メニューと実操作の条件を揃える。
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if readerWindow?.attachedSheet != nil { return false }
         if menuItem.action == #selector(toggleLoupe(_:)) { return session.canRead }

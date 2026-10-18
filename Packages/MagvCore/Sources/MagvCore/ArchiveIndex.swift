@@ -2,18 +2,20 @@ import Foundation
 import CArchive
 import Darwin
 
+/// アーカイブ内の画像位置。パスが重複しても、ヘッダーの出現順 ordinal で識別する。
 public struct ArchiveMember: Sendable {
     public let ordinal: Int
     public let path: String
     public let declaredSize: Int64
 }
+/// 自然順の画像一覧と、一覧取得時点のファイル更新情報。
 public struct ArchiveIndex: Sendable {
     public let members: [ArchiveMember]
     public let revision: FileRevision
 }
 
 extension ArchiveReader {
-    /// Enumerates headers without writing or decoding image payloads, including solid RAR5.
+    /// ソリッドRAR5を含め、画像本体を書き出したりデコードしたりせずヘッダーを列挙する。
     public static func index(_ url: URL, limits: ReaderLimits = ReaderLimits(),
                              include: (String) -> Bool = isImagePath) throws -> ArchiveIndex {
         try withArchiveLocale {
@@ -40,7 +42,7 @@ extension ArchiveReader {
     }
 }
 
-// Cursor calls run synchronously inside a worker actor. A reader never crosses simultaneous tasks.
+// カーソル操作はワーカーアクター内で同期実行し、同じ展開器を複数タスクから同時操作しない。
 final class ArchiveCursor {
     struct Header { let path: String; let size: Int64; let regular: Bool }
     let reader: OpaquePointer
@@ -51,6 +53,7 @@ final class ArchiveCursor {
         archive_read_support_format_rar(reader)
         archive_read_support_format_rar5(reader)
         archive_read_set_format_option(reader, "zip", "hdrcharset", "CP932")
+        // 同梱パッチの一覧専用モードでは、ソリッドRAR5も画像本体を展開せず列挙する。
         if indexOnly && archive_read_set_format_option(reader, "rar5", "magv-index-only", "1") != ARCHIVE_OK {
             archive_read_free(reader); throw ReaderError.archive("一覧取得用の展開器を初期化できません。")
         }
@@ -77,6 +80,7 @@ final class ArchiveCursor {
     func skip() throws { guard archive_read_data_skip(reader) >= ARCHIVE_OK else { throw ArchiveReader.error(reader) } }
 }
 
+/// ファイル名変換用のロケールを呼び出しスレッドだけに設定し、処理後に元へ戻す。
 func withArchiveLocale<T>(_ operation: () throws -> T) throws -> T {
     guard let locale = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", nil) else { throw ReaderError.archive("UTF-8のファイル名変換を初期化できません。") }
     let previous = uselocale(locale)
@@ -90,7 +94,7 @@ struct PreparedArchiveImage: Sendable {
     let file: ExtractionFileLease
 }
 
-/// Keeps a forward cursor for solid streams; backward cache misses reopen the stream.
+/// ソリッド圧縮の展開位置を前向きに保持し、過去の未キャッシュ画像は先頭から開き直す。
 actor ArchiveExtractionWorker {
     private var url: URL
     private let index: ArchiveIndex
@@ -112,6 +116,7 @@ actor ArchiveExtractionWorker {
             try Task.checkCancellation()
             guard try FileRevision.read(url) == index.revision else { throw ReaderError.sourceChanged }
             do {
+                // 前方は現在の展開位置から続行できる。通過済みの画像は先頭から読み直す。
                 if cursor == nil || member.ordinal < nextOrdinal { cursor = try ArchiveCursor(url: url); nextOrdinal = 0 }
                 guard let cursor else { throw ReaderError.archive("展開器を初期化できません。") }
                 while let header = try cursor.next(limits: limits, ordinal: nextOrdinal) {
@@ -133,7 +138,7 @@ actor ArchiveExtractionWorker {
                         file.seal(); extractionCount += 1
                         return PreparedArchiveImage(metadata: metadata, failure: failure, file: file)
                     }
-                    // ZIP and non-solid RAR4 skip payloads; RAR5 preserves solid dictionary state.
+                    // ZIPと非ソリッドRAR4は本体をスキップし、RAR5は読み進めてソリッド圧縮の辞書状態を維持する。
                     if !cursor.needsSolidDictionary { try cursor.skip() }
                     else { try drain(cursor, ordinal: ordinal, image: ArchiveReader.isImagePath(header.path), file: nil, handle: nil) }
                 }
@@ -150,6 +155,7 @@ actor ArchiveExtractionWorker {
             if size == 0 { return }
             count += Int64(size)
             guard !image || count <= limits.imageBytes else { throw ReaderError.limit("単一画像の展開量") }
+            // 同じエントリを読み直しても累積展開量を二重計上しない。実測した最大量だけを加算する。
             let additional = max(0, count - (expanded[ordinal] ?? 0))
             guard additional <= limits.sourceBytes - totalExpanded else { throw ReaderError.limit("ソース累積展開量") }
             totalExpanded += additional; expanded[ordinal] = max(count, expanded[ordinal] ?? 0)

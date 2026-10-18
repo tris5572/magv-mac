@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 import Darwin
 import MagvCore
 
+/// 合成データの生成と、選択展開・全件展開の比較計測を行う補助ツール。
 @main struct ReaderBenchmark {
     static func main() async throws {
         let arguments = Array(CommandLine.arguments.dropFirst())
@@ -25,6 +26,7 @@ import MagvCore
     static func milliseconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
     }
+    // 初期表示、先読み後の移動、同じ本の再訪を分けて測定する。UI描画時間は含まない。
     static func measure(_ url: URL, storage: ExtractionStorage) async throws {
         let sources = SourceCache(storage: storage)
         let images = ImageCache()
@@ -55,6 +57,7 @@ import MagvCore
         print(String(format: "  image cache: %.2f MiB; extraction: %.2f MiB; process peak RSS: %.2f MiB", Double(counts.display) / 1048576, Double(storage.byteCount) / 1048576, Double(usage.ru_maxrss) / 1048576))
         await sources.removeAll(); await images.removeAll()
     }
+    // 全画像を先に展開・寸法取得する経路を、選択展開との比較基準として測る。
     static func measureEager(_ url: URL, storage: ExtractionStorage) async throws {
         let directory = try TemporaryDirectory(storage: storage)
         let clock = ContinuousClock(); let start = clock.now
@@ -67,6 +70,7 @@ import MagvCore
         print(String(format: "\(url.lastPathComponent): eager reference, first spread %.2f ms; extraction %.2f MiB", elapsed, Double(storage.byteCount) / 1048576))
         await cache.removeAll(); withExtendedLifetime(directory) {}
     }
+    // 固定シードで同じ模様を生成し、入力データの差による計測のばらつきを抑える。
     static func generate(_ directory: URL, large: Bool = false) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let width = large ? 2000 : 1440, height = large ? 3000 : 2160
@@ -88,7 +92,7 @@ import MagvCore
             guard CGImageDestinationFinalize(destination) else { throw ReaderError.invalidImage("benchmark") }
         }
         if large {
-            // Calibrate the synthetic JPEG so the 300-page input stays below the 500MiB reference size.
+            // 合成JPEGの品質を調整し、300ページ全体を基準の500MiB未満に収める。
             var lower = 0.05, upper = 0.9
             var selected: Data?
             for _ in 0..<7 {

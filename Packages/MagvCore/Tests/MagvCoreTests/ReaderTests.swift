@@ -14,6 +14,7 @@ private func temporary() throws -> URL {
     return url
 }
 
+// 前へ戻るとき、縦横の組み合わせに応じた元仕様の見開き構成になることを確認する。
 @Test func previousSpreadMatchesOriginalCases() {
     let cases: [([ImageOrientation], Int, Int, Bool)] = [
         ([p,p],1,0,true), ([p,l],1,0,true), ([l,p],1,0,true), ([l,l],1,0,true),
@@ -28,6 +29,7 @@ private func temporary() throws -> URL {
     }
 }
 
+// 空の一覧・単体・正方形・末尾の見開きという境界条件を確認する。
 @Test func emptySingleSquareAndLastSpread() {
     #expect(PageNavigator.page(at: 0, orientations: [], mode: .spread) == nil)
     let one = PageNavigator.page(at: 0, orientations: [p], mode: .spread)
@@ -43,6 +45,7 @@ private func temporary() throws -> URL {
     #expect(PageNavigator.move(.nextImage, from: last, orientations: [p,p,p,p], mode: .spread) == last)
 }
 
+// 縦横の組み合わせと操作を網羅し、移動先が画像一覧の範囲を外れないことを確認する。
 @Test func navigationAlwaysStaysInBounds() {
     for length in 1...6 {
         for code in 0..<Int(pow(3.0, Double(length))) {
@@ -67,6 +70,7 @@ private func temporary() throws -> URL {
     }
 }
 
+// ページバーの範囲外入力を丸め、右開きでは位置が反転することを確認する。
 @Test func indicatorClampsAndReverses() {
     #expect(PageNavigator.index(at: 0, count: 0, direction: .rightToLeft) == nil)
     #expect(PageNavigator.index(at: .nan, count: 10, direction: .rightToLeft) == nil)
@@ -78,6 +82,7 @@ private func temporary() throws -> URL {
     #expect(PageNavigator.progress(page: PageNavigator.page(at: 0, orientations: [p], mode: .spread), count: 1) == 1)
 }
 
+// RAR4の実データを展開し、ファイル名だけでなく本体が正しいことを確認する。
 @Test func rar4DecodesRealPayload() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     let entries = try ArchiveReader.extract(fixture("test_read_format_rar.rar"), into: dir, include: { _ in true })
@@ -85,6 +90,7 @@ private func temporary() throws -> URL {
     for entry in entries { #expect(try String(contentsOf: entry.fileURL, encoding: .utf8) == "test text document\r\n") }
 }
 
+// 通常・ソリッドRAR5の展開結果を、規則的に生成した期待データと比較する。
 @Test(arguments: ["test_read_format_rar5_compressed.rar", "test_read_format_rar5_multiple_files_solid.rar"])
 func rar5PayloadMatchesGeneratedData(_ name: String) throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
@@ -103,6 +109,7 @@ func rar5PayloadMatchesGeneratedData(_ name: String) throws {
     }
 }
 
+// RAR4／RAR5のUnicodeファイル名が保持されることを確認する。
 @Test(arguments: ["test_read_format_rar_unicode.rar", "test_read_format_rar5_unicode.rar"])
 func rarUnicodeNames(_ name: String) throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
@@ -111,6 +118,7 @@ func rarUnicodeNames(_ name: String) throws {
     #expect(entries.contains { !$0.path.isASCII })
 }
 
+// 暗号化されたRARを形式ごとに拒否できることを確認する。
 @Test(arguments: ["test_read_format_rar_encryption_data.rar", "test_read_format_rar4_solid_encrypted.rar", "test_read_format_rar5_solid_encrypted.rar"])
 func encryptedArchivesAreRejected(_ name: String) throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
@@ -118,6 +126,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
     #expect(throws: ReaderError.encrypted) { try ArchiveReader.index(fixture(name), include: { _ in true }) }
 }
 
+// 危険なパスとmacOS付随ファイルが閲覧対象にならないことを確認する。
 @Test func unsafePathsAndAppleMetadata() {
     for path in ["/abs.jpg", "../x.jpg", "a/../../x.jpg", "C:\\x.jpg", "a\\..\\x.jpg"] { #expect(!ArchiveReader.isSafePath(path)) }
     #expect(ArchiveReader.isSafePath("漫画/2.JPG"))
@@ -125,6 +134,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
     #expect(ArchiveReader.isImagePath("漫画/2.JPG"))
 }
 
+// ZIPの自然順・不要項目の除外・ZIP64対応を確認する。
 @Test func zipNaturalOrderFilteringAndZIP64() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     let entries = try ArchiveReader.extract(fixture("images.zip"), into: dir)
@@ -134,6 +144,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
     #expect(!zip64.isEmpty)
 }
 
+// 展開上限と破損アーカイブのエラーを確認する。
 @Test func archiveLimitsAndCorruption() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     var limits = ReaderLimits(); limits.imageBytes = 10
@@ -147,6 +158,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
     #expect(throws: ReaderError.self) { try ArchiveReader.extract(fixture("unsafe.zip"), into: dir) }
 }
 
+// フォルダ列挙と画像の直接指定で、並び順と開始位置を確認する。
 @Test func directoryAndDirectImageLoading() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     let image = try Data(contentsOf: fixture("portrait.png"))
@@ -161,6 +173,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
     #expect(throws: ReaderError.self) { try SourceLoader.load(empty) }
 }
 
+// 対応画像の寸法取得と、正方形を見開きの縦長画像に分類しないことを確認する。
 @Test func imageFormatsAndSquare() throws {
     let metadata = try ImageDecoder.metadata(at: fixture("square.png")); #expect(metadata.orientation == .landscape)
     let image = try ImageDecoder.decode(at: fixture("portrait.png"), maxPixelSize: 10)
@@ -169,6 +182,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
     #expect(webp.image.width == 1 && webp.image.height == 1)
 }
 
+// EXIF回転後の縦横で見開きを判断することを確認する。
 @Test func exifRotationChangesPortraitDecision() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     let image = try ImageDecoder.decode(at: fixture("portrait.png"), maxPixelSize: 40).image
@@ -184,6 +198,7 @@ func encryptedArchivesAreRejected(_ name: String) throws {
 
 private extension String { var isASCII: Bool { unicodeScalars.allSatisfy(\.isASCII) } }
 
+// UTF-8指定のない日本語ZIPのファイル名をCP932で復元できることを確認する。
 @Test func legacyJapaneseZIPNames() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     let entries = try ArchiveReader.extract(fixture("test_read_format_zip_filename_cp932.zip"), into: dir, include: { _ in true })
@@ -191,6 +206,7 @@ private extension String { var isASCII: Bool { unicodeScalars.allSatisfy(\.isASC
     for entry in entries { #expect(try Data(contentsOf: entry.fileURL).count == 5) }
 }
 
+// キャンセル済みタスクがソース読み込みを完了できないことを確認する。
 @Test func canceledOpenCannotLoadSource() async throws {
     let task = Task.detached {
         withUnsafeCurrentTask { $0?.cancel() }
@@ -201,6 +217,7 @@ private extension String { var isASCII: Bool { unicodeScalars.allSatisfy(\.isASC
     catch { Issue.record("Expected cancellation, received \(error)") }
 }
 
+// 異なる圧縮設定のRAR4で、展開した本体データを確認する。
 @Test(arguments: ["test_read_format_rar_compress_normal.rar", "test_read_format_rar_compress_best.rar"])
 func compressedRAR4Payloads(_ name: String) throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
@@ -214,6 +231,7 @@ func compressedRAR4Payloads(_ name: String) throws {
     #expect(text == "test text document\r\n")
 }
 
+// ソースの最後の参照を解放すると、一時展開領域も削除されることを確認する。
 @Test func archiveSourceLifecycle() throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     func loadAndRelease() throws -> URL {

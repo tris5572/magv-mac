@@ -1,6 +1,6 @@
 import Foundation
 
-/// Metadata survives disk eviction; image files are materialized on demand and pinned only while used.
+/// ディスクから画像が削除されても寸法情報は残し、必要な画像だけを展開・利用中だけ保持する。
 public actor ArchiveImageStore {
     private struct Known { let metadata: ImageMetadata?; let failure: String?; let fileID: UUID }
     private struct Pending {
@@ -13,6 +13,7 @@ public actor ArchiveImageStore {
     private let access: FileAccessLease
     private let worker: ArchiveExtractionWorker
     nonisolated let initialEntries: [ImageEntry]
+    // 確認済みの寸法・失敗情報と、進行中の展開を別々に保持する。
     private var known: [Int: Known] = [:]
     private var pending: [Int: Pending] = [:]
 
@@ -25,6 +26,7 @@ public actor ArchiveImageStore {
         worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: limits)
     }
 
+    /// 寸法だけの要求では既知情報を使い、ファイルが必要な要求では削除を防ぐリースを返す。
     func prepare(_ indices: [Int], files: Bool, speculative: Bool) async throws -> (images: [ImageEntry], leases: [ExtractionFileLease]) {
         try Task.checkCancellation()
         guard try FileRevision.read(url) == index.revision else { throw ReaderError.sourceChanged }
@@ -44,6 +46,7 @@ public actor ArchiveImageStore {
         for (index, state) in known { result[index].metadata = state.metadata; result[index].failure = state.failure }
         return (result, leases)
     }
+    // 同じ画像の同時要求は1つの展開タスクを共有する。表示要求が加われば先読み扱いを解除する。
     private func materialize(_ index: Int, speculative: Bool) async throws -> ExtractionFileLease {
         let consumer = UUID(); let work: Pending
         if var current = pending[index], !current.task.isCancelled {
@@ -71,6 +74,7 @@ public actor ArchiveImageStore {
             throw error
         }
     }
+    // 1つの要求がキャンセルされても、他の利用者が待っている展開は止めない。
     private func releaseConsumer(_ index: Int, id: UUID, consumer: UUID) {
         guard var work = pending[index], work.id == id else { return }
         work.consumers.remove(consumer)

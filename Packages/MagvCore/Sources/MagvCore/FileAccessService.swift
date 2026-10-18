@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 
+/// デバイス・inode・サイズ・更新時刻を使い、同じパスへのファイル置換も検出する。
 public struct FileRevision: Hashable, Sendable {
     private let device: Int32
     private let inode: UInt64
@@ -17,6 +18,7 @@ public struct FileRevision: Hashable, Sendable {
     }
 }
 
+/// 生存期間に合わせてsecurity-scoped resourceのアクセス開始と終了を対にする。
 public final class FileAccessLease: @unchecked Sendable {
     private let url: URL
     private let scoped: Bool
@@ -27,11 +29,13 @@ public final class FileAccessLease: @unchecked Sendable {
     deinit { if scoped { url.stopAccessingSecurityScopedResource() } }
 }
 
+/// ファイル列挙、許可範囲の判定、上書きを防ぐ名前変更を提供する。
 public enum FileAccessService {
     public static func sameLocation(_ lhs: URL, _ rhs: URL) -> Bool {
         lhs.standardizedFileURL.path == rhs.standardizedFileURL.path
     }
 
+    // シンボリックリンクを解決し、文字列の前方一致ではなくパス要素で範囲を判定する。
     public static func contains(_ directory: URL, _ url: URL) -> Bool {
         let root = resolvedLocation(directory).pathComponents
         let path = resolvedLocation(url).pathComponents
@@ -39,7 +43,7 @@ public enum FileAccessService {
     }
 
     private static func resolvedLocation(_ url: URL) -> URL {
-        // Foundation leaves intermediate links unresolved when the final component doesn't exist.
+        // 末尾が未作成だとFoundationが途中のリンクを解決しないため、存在する祖先から解決する。
         var ancestor = url.standardizedFileURL
         var suffix: [String] = []
         while ancestor.path != "/", !FileManager.default.fileExists(atPath: ancestor.path) {
@@ -48,6 +52,7 @@ public enum FileAccessService {
         return suffix.reversed().reduce(ancestor.resolvingSymlinksInPath()) { $0.appendingPathComponent($1) }.standardizedFileURL
     }
 
+    /// 同じ親フォルダから、アーカイブ同士またはフォルダ同士の移動候補を自然順で返す。
     public static func siblings(of source: URL, kind: SourceKind) throws -> [URL] {
         do {
             var urls = try FileManager.default.contentsOfDirectory(at: source.deletingLastPathComponent(),
@@ -59,11 +64,11 @@ public enum FileAccessService {
                         ? values.isRegularFile == true && SourceFormat.archiveExtensions.contains(url.pathExtension.lowercased())
                         : values.isDirectory == true
                 }
-            // An explicitly opened/renamed hidden source still needs a position among its visible siblings.
+            // 明示的に開いた、または名前変更で隠し項目になったソースも、移動時の現在位置として含める。
             if !urls.contains(where: { sameLocation($0, source) }),
                let values = try? source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey]),
                (kind == .archive ? values.isRegularFile == true : values.isDirectory == true) { urls.append(source) }
-            // Match SourceLoader's URL form before a rename makes the old path nonexistent.
+            // 名前変更で旧パスが消える前に、SourceLoaderと同じ正規化済みURLに揃える。
             return urls.map { $0.resolvingSymlinksInPath().standardizedFileURL }
                 .sorted { SourceFormat.naturalOrder($0.lastPathComponent, $1.lastPathComponent) }
         } catch let error as CocoaError where error.code == .fileReadNoPermission { throw ReaderError.permission }
@@ -75,7 +80,7 @@ public enum FileAccessService {
               !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { throw ReaderError.invalidName }
     }
 
-    /// Same-directory atomic rename, with exclusive destination creation even if another process races us.
+    /// 同一フォルダ内で不可分に名前を変更し、他プロセスとの競合時も既存の宛先を上書きしない。
     public static func renameArchive(at source: URL, baseName: String, expectedRevision: FileRevision? = nil) throws -> URL {
         guard SourceFormat.archiveExtensions.contains(source.pathExtension.lowercased()) else { throw ReaderError.unsupported }
         try validateBaseName(baseName)
@@ -87,6 +92,7 @@ public enum FileAccessService {
             let destination = source.deletingLastPathComponent().appendingPathComponent(candidate).appendingPathExtension(source.pathExtension)
             if renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 { return destination }
             let code = errno
+            // 別プロセスと競合しても上書きせず、末尾に「_」を足して再試行する。
             if code == EEXIST { candidate += "_"; continue }
             throw fileError(code)
         }
@@ -103,6 +109,7 @@ public enum FileAccessService {
         }
     }
 
+    /// 直下の通常画像だけを自然順で返す。隠しファイルとリンク先は列挙対象に含めない。
     public static func images(in directory: URL) throws -> [URL] {
         try FileManager.default.contentsOfDirectory(at: directory,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])

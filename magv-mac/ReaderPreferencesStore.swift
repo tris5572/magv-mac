@@ -1,6 +1,7 @@
 import Foundation
 import MagvCore
 
+/// 表示設定とウィンドウ位置を保持し、短時間の連続変更をまとめて保存する。
 @MainActor final class ReaderPreferencesStore {
     private let store: SettingsStore?
     private(set) var settings: ReaderSettings
@@ -16,7 +17,7 @@ import MagvCore
         else {
             var initial = ReaderSettings()
             if let store, !FileManager.default.fileExists(atPath: store.url.path) {
-                // Migrate only this native app's earlier preferences; never read the Tauri app's settings.
+                // このネイティブ版の旧設定だけを移行し、Tauri版の設定は読み込まない。
                 initial.displayMode = DisplayMode(rawValue: UserDefaults.standard.string(forKey: "displayMode") ?? "") ?? .spread
                 initial.readingDirection = ReadingDirection(rawValue: UserDefaults.standard.string(forKey: "readingDirection") ?? "") ?? .rightToLeft
             }
@@ -30,6 +31,7 @@ import MagvCore
         guard WindowFrame(frame).isValid else { return }
         settings.window = SavedWindow(frame: WindowFrame(frame)); scheduleSave()
     }
+    // 最後の変更から250ms待つ。終了時はflushを呼び、待機中の変更も保存する。
     private func scheduleSave() {
         pendingSave?.cancel()
         pendingSave = Task { [weak self] in
@@ -45,6 +47,8 @@ import MagvCore
     }
 }
 
+/// 選択したURLのアクセス権と保存済みフォルダ許可を管理する。
+/// ファイルを選んだだけでは、親フォルダ全体の許可として記録しない。
 @MainActor final class SessionFileAccess {
     private var selections: [String: FileAccessLease] = [:]
     private var directories: [URL] = []
@@ -86,10 +90,11 @@ import MagvCore
         } catch { NSLog("magv: フォルダの許可情報を作成できません: %@", error.localizedDescription) }
     }
 
+    // 必要になった時点でブックマークを復元し、利用可能なフォルダの権限だけを保持する。
     private func restoreDirectoryAccess(for url: URL) {
         guard !directories.contains(where: { FileAccessService.contains($0, url) }) else { return }
         for index in bookmarks.indices {
-            // Missing volumes and invalid bookmarks stay saved for a future retry.
+            // 未接続ボリュームや復元できないブックマークも、後で再試行できるよう保存を残す。
             guard let resolved = try? bookmarkCodec.resolve(bookmarks[index]) else { continue }
             let lease = FileAccessLease(url: resolved.url)
             let usable = withExtendedLifetime(lease) {
@@ -111,6 +116,7 @@ import MagvCore
         do { try bookmarkStore?.save(bookmarks) }
         catch { NSLog("magv: フォルダの許可情報を保存できません: %@", error.localizedDescription) }
     }
+    // フォルダ全体の許可がない場合は、ユーザーが実際に選択したURLから開き直す。
     func reopeningURL(for url: URL) -> URL {
         covers(url) ? url : originals[url.standardizedFileURL.path] ?? url
     }
@@ -119,6 +125,7 @@ import MagvCore
         originals.removeValue(forKey: old.standardizedFileURL.path)
         originals[new.standardizedFileURL.path] = new
     }
+    // 履歴に必要なアクセス権だけを残す。保存済みブックマークは次回復元用に維持する。
     func trim(to recent: [URL]) {
         let paths = Set(recent.map { $0.standardizedFileURL.path })
         originals = originals.filter { paths.contains($0.key) }

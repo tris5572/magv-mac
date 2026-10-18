@@ -1,5 +1,6 @@
 import Foundation
 
+/// 選択URLをアーカイブ・画像・フォルダに分類し、共通のLoadedSourceへ変換する。
 public enum SourceLoader {
     public static func load(_ selectedURL: URL, limits: ReaderLimits = ReaderLimits(),
                              temporaryRoot: URL? = nil,
@@ -25,6 +26,7 @@ public enum SourceLoader {
                 sourceURL = url
                 kind = .archive
                 progress("画像の一覧を確認中…")
+                // アーカイブは一覧だけを先に読み、画像の実体は表示時にArchiveImageStoreで展開する。
                 let index = try ArchiveReader.index(url, limits: limits)
                 guard !index.members.isEmpty else { throw ReaderError.noImages }
                 let directory = try TemporaryDirectory(storage: storage ?? ExtractionStorage.shared(root: temporaryRoot))
@@ -36,7 +38,7 @@ public enum SourceLoader {
                 sourceURL = url.deletingLastPathComponent()
                 kind = .directory
                 temporary = nil
-                // A selected image can remain readable even if its parent isn't authorized.
+                // 親フォルダが未許可でも、選択した画像そのものは読み込めるようにする。
                 let directoryImages = try? FileAccessService.images(in: sourceURL)
                 partialDirectory = directoryImages == nil
                 let urls = directoryImages?.contains(where: { $0.resolvingSymlinksInPath().path == url.path }) == true ? directoryImages! : [url]
@@ -46,6 +48,7 @@ public enum SourceLoader {
             guard !files.isEmpty else { throw ReaderError.noImages }
             guard files.count <= limits.entryCount else { throw ReaderError.limit("画像数") }
             var images: [ImageEntry] = []
+            // 直接参照できる画像は寸法を列挙時に確認する。壊れた1枚は失敗情報として残す。
             for (index, file) in files.enumerated() {
                 try Task.checkCancellation()
                 if index % 16 == 0 { progress("画像を確認中… \(index + 1) / \(files.count)") }

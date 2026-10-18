@@ -1,6 +1,6 @@
 import Foundation
 
-/// Cache keys cover both archive identity and the direct images of a directory.
+/// アーカイブ自身の更新情報、またはフォルダ直下の画像一覧と各画像の更新情報をキーに含める。
 private struct SourceFingerprint: Hashable, Sendable {
     let url: URL
     let files: [URL]
@@ -20,6 +20,7 @@ private struct SourceFingerprint: Hashable, Sendable {
     }
 }
 
+/// ソースの一覧と進行中の読み込みを共有し、保持件数を制限するキャッシュ。
 public actor SourceCache {
     private struct Value { let source: LoadedSource; var touched: UInt64; var prefetched: Bool }
     private struct Pending { let id: UUID; let task: Task<LoadedSource, Error>; var prefetched: Bool }
@@ -37,7 +38,7 @@ public actor SourceCache {
         let key = try await Task.detached(priority: prefetch ? .utility : .userInitiated) { try SourceFingerprint.read(url) }.value
         try Task.checkCancellation()
         if !prefetch { await cancelPrefetch(except: url); try Task.checkCancellation() }
-        // A file replacement or directory edit invalidates the old extraction/list immediately.
+        // ファイルの置換やフォルダの変更を検出したら、古い一覧・展開結果をすぐ無効にする。
         for old in values.keys where old.url == key.url && old != key { values[old] = nil }
         for old in pending.keys where old.url == key.url && old != key { pending.removeValue(forKey: old)?.task.cancel() }
         clock &+= 1
@@ -47,6 +48,7 @@ public actor SourceCache {
             return try await prepare(value.source, at: initialIndex, mode: mode, prefetch: prefetch)
         }
         let work: Pending
+        // 先読み中の本を開く場合も同じ読み込みを共有し、通常の要求へ昇格させる。
         if var existing = pending[key] {
             existing.prefetched = existing.prefetched && prefetch; pending[key] = existing; work = existing
         } else {
@@ -78,6 +80,7 @@ public actor SourceCache {
     private func trim() {
         while values.count > countLimit { if !evictOldest() { break } }
     }
+    // 件数超過時は先読みした本を優先し、同じ分類では最後の利用が古い本を外す。
     @discardableResult private func evictOldest() -> Bool {
         guard let oldest = values.min(by: {
                 if $0.value.prefetched != $1.value.prefetched { return $0.value.prefetched }
@@ -97,6 +100,7 @@ public actor SourceCache {
         let archives = values.filter { $0.key.url != keep }.values.compactMap { $0.source.archive }
         for archive in archives { await archive.cancelAll() }
     }
+    /// 名前変更後も展開済みの画像を再利用し、キャッシュの識別情報だけを作り直す。
     public func relocate(_ source: LoadedSource, from oldURL: URL) async {
         await source.archive?.relocate(to: source.url)
         invalidate(oldURL); invalidate(source.url)

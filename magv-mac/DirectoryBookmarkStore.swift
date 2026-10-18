@@ -1,6 +1,6 @@
 import Foundation
 
-/// Kept separate from display preferences and in-memory reading history.
+/// フォルダの許可情報を、表示設定や起動中だけの閲覧履歴とは別に保存する。
 struct DirectoryBookmarkStore {
     let url: URL
     private struct Document: Codable {
@@ -8,6 +8,7 @@ struct DirectoryBookmarkStore {
         var folders: [Data]
     }
 
+    // 未作成・破損・未対応バージョンの保存データは、許可情報なしとして扱う。
     func load() -> [Data] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         do {
@@ -19,6 +20,7 @@ struct DirectoryBookmarkStore {
         }
     }
 
+    // 一時ファイルからの置換で保存し、書き込み途中のJSONが残ることを避ける。
     func save(_ folders: [Data]) throws {
         let data = try JSONEncoder().encode(Document(folders: folders))
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -26,6 +28,7 @@ struct DirectoryBookmarkStore {
     }
 }
 
+/// ブックマークの生成・復元を差し替え可能にし、OSの権限機構に依存せずテストできる。
 @MainActor struct DirectoryBookmarkCodec {
     var create: (URL) throws -> Data
     var resolve: (Data) throws -> (url: URL, stale: Bool)

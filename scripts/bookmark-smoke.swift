@@ -1,6 +1,7 @@
 import AppKit
 import MagvCore
 
+/// 通常は差し替えた変換処理で保存を検証し、--bookmarks時は実際の権限を別プロセスで復元する。
 @main struct BookmarkSmoke {
     @MainActor static func main() async throws {
         let arguments = Array(CommandLine.arguments.dropFirst())
@@ -37,7 +38,7 @@ import MagvCore
     }
 
     @MainActor private static func persistenceAndRecovery(root: URL, directory: URL) throws {
-        // Deterministic failure and stale-data cases run without ScopedBookmarksAgent.
+        // 失敗・古いデータのケースを、ScopedBookmarksAgentなしで再現できる変換処理で検証する。
         let codec = DirectoryBookmarkCodec(create: { Data($0.absoluteString.utf8) }, resolve: { data in
             guard let text = String(data: data, encoding: .utf8), let url = URL(string: text), url.isFileURL else {
                 throw ReaderError.permission
@@ -87,14 +88,14 @@ import MagvCore
         try require(!recovered.covers(archive) && preferences.settings.displayMode == .single, "Corrupt bookmark storage granted access or affected preferences")
         recovered.retain(directory, asDirectoryGrant: true)
         try require(store.load().count == 1, "Selecting a folder did not repair corrupt bookmark storage")
-        let unwritable = DirectoryBookmarkStore(url: outside) // Existing directory cannot be replaced by an atomic file write.
+        let unwritable = DirectoryBookmarkStore(url: outside) // 既存ディレクトリはファイルの不可分な書き込みで置換できないため、保存失敗を再現できる。
         let temporary = SessionFileAccess(bookmarkStore: unwritable, bookmarkCodec: codec)
         temporary.retain(directory, asDirectoryGrant: true)
         try require(temporary.covers(archive), "Save failure prevented use of the current folder grant")
     }
 
     @MainActor private static func restoreInNewProcess(directory: URL, storeURL: URL) async throws {
-        // Use the production Foundation codec and a fresh ReaderSession/preferences store.
+        // 本番のFoundation変換処理と、新しいReaderSession・設定ストアで復元を検証する。
         let preferences = ReaderPreferencesStore(store: SettingsStore(url: storeURL.deletingLastPathComponent().appendingPathComponent("settings.json")))
         let reader = ReaderSession(preferences: preferences)
         defer { reader.shutdown() }

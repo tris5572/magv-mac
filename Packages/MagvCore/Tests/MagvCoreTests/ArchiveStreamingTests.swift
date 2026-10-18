@@ -30,6 +30,7 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     guard archive_write_close(writer) == ARCHIVE_OK else { throw ReaderError.archive("test close") }
 }
 
+// 開く時点では表示対象だけを展開し、後続ページの容量で初期表示が妨げられないことを確認する。
 @Test func archiveOpenExtractsOnlyRequestedPages() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let png = try Data(contentsOf: streamingFixture("portrait.png"))
@@ -44,12 +45,13 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     #expect(source.images[2].metadata == nil && !FileManager.default.fileExists(atPath: source.images[2].fileURL.path))
     #expect(storage.byteCount == Int64(png.count * 2))
     #expect(await source.archive?.extractionCount == 2)
-    // A later image can exceed the available disk quota without preventing the initial spread from opening.
+    // 後続画像がディスク上限を超えていても、最初の見開きは開ける。
     await #expect(throws: ReaderError.limit("一時ディスクキャッシュ全体2GiB")) { _ = try await source.preparingImages(at: [2]) }
     #expect(storage.byteCount == Int64(png.count * 2))
     #expect(source.images.prefix(2).allSatisfy { FileManager.default.fileExists(atPath: $0.fileURL.path) })
 }
 
+// 読み終えた画像を順に削除し、展開総量がディスク上限を超える本も読み進められることを確認する。
 @Test func pageDiskLRUAllowsReadingBeyondItsTotalCapacity() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let png = try Data(contentsOf: streamingFixture("portrait.png"))
@@ -70,6 +72,7 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     #expect(await source.archive?.extractionCount == 41)
 }
 
+// 同じページへの同時要求が、1回の展開を共有することを確認する。
 @Test func concurrentPageRequestsShareOneExtraction() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let cache = SourceCache(temporaryRoot: root)
@@ -84,6 +87,7 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     #expect(await source.archive?.extractionCount == 3)
 }
 
+// 重複パスを別項目として保ち、除外対象も含む全ヘッダーで安全性を検証することを確認する。
 @Test func indexPreservesDuplicatePathsAndValidatesAllHeaders() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let portrait = try Data(contentsOf: streamingFixture("portrait.png"))
@@ -102,6 +106,7 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     #expect(throws: ReaderError.self) { try ArchiveReader.index(zip, limits: limits) }
 }
 
+// RAR5の一覧専用モードと通常展開を分離し、ソリッド圧縮を継続して読めることを確認する。
 @Test func rar5IndexOnlyReaderCannotDecodeAndNormalReaderResumesSolid() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let url = streamingFixture("test_read_format_rar5_multiple_files_solid.rar")
@@ -129,6 +134,7 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     }
 }
 
+// ページ展開のキャンセルで、未完成ファイルと容量予約を解放することを確認する。
 @Test func cancelledPageExtractionRemovesUnfinishedFileAndReservation() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let png = try Data(contentsOf: streamingFixture("portrait.png"))
@@ -148,6 +154,7 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     #expect(!FileManager.default.fileExists(atPath: output.path))
 }
 
+// ページ単位のRAR展開結果を、全件展開した結果と比較する。
 @Test(arguments: ["test_read_format_rar_compress_normal.rar", "test_read_format_rar5_compressed.rar"])
 func selectiveRARReadsMatchFullExtraction(_ name: String) async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
@@ -163,6 +170,7 @@ func selectiveRARReadsMatchFullExtraction(_ name: String) async throws {
     }
 }
 
+// 一覧取得でもZIPの文字コードとZIP64を扱えることを確認する。
 @Test(arguments: ["images.zip", "test_read_format_zip_filename_cp932.zip", "test_read_format_zip_zip64a.zip"])
 func indexRetainsZIPNamesAndZIP64(_ name: String) throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
@@ -171,6 +179,7 @@ func indexRetainsZIPNamesAndZIP64(_ name: String) throws {
     #expect(index.members.map(\.path) == extracted.map(\.path))
 }
 
+// 単体表示や横長ページでは、不要な2枚目の展開を待たないことを確認する。
 @Test func singlePageAndLandscapeOpenDoNotWaitForSecondImage() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let portrait = try Data(contentsOf: streamingFixture("portrait.png"))
@@ -203,6 +212,7 @@ private final class DecodeGate: @unchecked Sendable {
     func resume() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
 }
 
+// 先読み待機のキャンセル有無や完了時点を変え、ページ移動が同じデコードを再利用することを確認する。
 @Test(arguments: [false, true])
 func pageTurnReusesActiveOrCompletedPrefetch(_ cancelConsumer: Bool) async throws {
     for finishBeforeDisplay in [false, true] {
@@ -237,6 +247,7 @@ func pageTurnReusesActiveOrCompletedPrefetch(_ cancelConsumer: Bool) async throw
     }
 }
 
+// 破棄した先読みが後から完了しても、キャッシュへ再登録されないことを確認する。
 @Test(arguments: [false, true])
 func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
     let gate = DecodeGate(); defer { gate.resume() }
@@ -256,6 +267,7 @@ func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
     #expect(await cache.byteCounts.display == 0)
 }
 
+// 待機要求のキャンセル後も、実デコードが終わるまでは展開ファイルを削除しないことを確認する。
 @Test func cancelledPrefetchKeepsFilePinnedUntilDecoderActuallyFinishes() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let storage = try ExtractionStorage(root: root)
@@ -287,6 +299,7 @@ func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
     withExtendedLifetime(descriptor) {}
 }
 
+// 実行中のデコードを待たず、不要になった待機中の表示要求をキャンセルできることを確認する。
 @Test func obsoleteQueuedDisplayDecodeIsCancelledWithoutWaitingForActiveDecoder() async throws {
     let gate = DecodeGate(); defer { gate.resume() }
     let firstURL = streamingFixture("portrait.png")

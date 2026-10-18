@@ -13,6 +13,7 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     return url
 }
 
+// 兄弟ソースの種類を絞り、自然順で列挙することを確認する。
 @Test func siblingKindsAndNaturalOrder() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     for name in ["10.RAR", "1.zip", "2.ZIP", ".hidden.zip", "image.png", "book.txt"] { _ = try write(name, in: root) }
@@ -25,6 +26,7 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     #expect(try FileAccessService.siblings(of: hidden, kind: .archive).contains(hidden))
 }
 
+// 兄弟一覧の両端で停止し、ランダム移動が現在の本を選ばないことを確認する。
 @Test func siblingEdgesAndRandomExclusion() {
     let urls = ["1.zip", "2.zip", "10.zip"].map { URL(fileURLWithPath: "/books/" + $0) }
     #expect(SourceNavigator.destination(.previous, current: urls[0], siblings: urls) == nil)
@@ -35,6 +37,7 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     for _ in 0..<30 { #expect(SourceNavigator.destination(.random, current: urls[1], siblings: urls) != urls[1]) }
 }
 
+// 名前変更前に確保した兄弟URLが、変更後も同じ場所を表すことを確認する。
 @Test func siblingURLsKeepTheirIdentityAfterRename() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let directory = root.appendingPathComponent("books", isDirectory: true)
@@ -50,6 +53,7 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     #expect(try FileAccessService.siblings(of: renamed, kind: .archive).contains(renamed))
 }
 
+// 名前変更で拡張子と内容を保ち、同名があれば上書きを避けることを確認する。
 @Test func renamePreservesExtensionContentAndAvoidsCollisions() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let source = try write("a.b.ZIP", in: root, content: "original bytes")
@@ -66,6 +70,7 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     #expect(again.lastPathComponent == "!!日本語 a.b__.ZIP")
 }
 
+// 無効な名前の入力では、実ファイルが移動しないことを確認する。
 @Test(arguments: ["", " ", ".", "..", "a/b", "a\\b", "a:b", "a\0b", "a\nb"])
 func invalidNamesCannotMoveFiles(_ name: String) throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
@@ -74,6 +79,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(FileManager.default.fileExists(atPath: source.path))
 }
 
+// 同じ名前への変更と、アーカイブ以外を変更しない制限を確認する。
 @Test func unchangedNameAndArchiveRestriction() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let source = try write("a.b.rar", in: root)
@@ -82,6 +88,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(throws: ReaderError.unsupported) { try FileAccessService.renameArchive(at: image, baseName: "!page") }
 }
 
+// 同時に同じ宛先へ変更しても、既存ファイルを上書きしないことを確認する。
 @Test func simultaneousRenameDoesNotOverwrite() async throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let first = try write("a.zip", in: root, content: "a")
@@ -95,6 +102,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(try String(contentsOf: two, encoding: .utf8) == "b")
 }
 
+// 開いた後で置換されたファイルを、古い更新情報のまま名前変更しないことを確認する。
 @Test func externallyReplacedArchiveIsNotRenamed() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let source = try write("book.zip", in: root)
@@ -106,6 +114,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("new.zip").path))
 }
 
+// 似た名前の別フォルダやシンボリックリンク経由で、許可範囲を越えないことを確認する。
 @Test func folderGrantChecksPathBoundariesAndLinks() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let folder = root.appendingPathComponent("book")
@@ -119,6 +128,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(!FileAccessService.contains(folder, link.appendingPathComponent("page.png")))
 }
 
+// 検索URLで日本語と「+」などの文字が正しく保持されることを確認する。
 @Test func searchRetainsJapaneseAndLiteralQueryCharacters() throws {
     let archive = URL(fileURLWithPath: "/books/日本語-a.b+&?#.ZIP")
     let url = try #require(SourceSearch.url(for: archive, kind: .archive))
@@ -132,6 +142,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(SourceSearch.url(for: URL(fileURLWithPath: "/books/---.zip"), kind: .archive) == nil)
 }
 
+// モニター構成の変更や異常な保存値があっても、画面内へウィンドウを復元することを確認する。
 @Test func savedWindowIsReachableAcrossMonitorChanges() throws {
     let main = CGRect(x: 0, y: 40, width: 1440, height: 860)
     let secondary = CGRect(x: -1280, y: 50, width: 1280, height: 720)
@@ -149,6 +160,7 @@ func invalidNamesCannotMoveFiles(_ name: String) throws {
     #expect(WindowPlacement.restore(saved, visibleFrames: [], minimumSize: minimum) == nil)
 }
 
+// 設定の保存・復元と、破損データからの復帰を確認する。
 @Test func settingsRoundTripAndCorruptionRecovery() throws {
     let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
     let store = SettingsStore(url: root.appendingPathComponent("support/settings.json"))

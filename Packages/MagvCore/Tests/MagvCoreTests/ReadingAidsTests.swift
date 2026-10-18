@@ -10,6 +10,7 @@ private func aidTemporary() throws -> URL {
     return url
 }
 
+// 再生間隔の範囲・有限値・0.5秒刻みの入力制限を確認する。
 @Test func slideshowIntervalsRejectInvalidOrFractionalSteps() {
     for text in ["", " ", "NaN", "inf", "-inf", "0", "-1", "0.25", "1.1", "100000.5", "abc"] {
         #expect(SlideshowInterval.parse(text) == nil)
@@ -17,6 +18,7 @@ private func aidTemporary() throws -> URL {
     for value in [0.5, 1, 5, 99999.5, 100000] { #expect(SlideshowInterval.parse(" \(value)\n") == value) }
 }
 
+// 余白を含む表示枠ではなく、配置済み画像とマウス位置からルーペを計算することを確認する。
 @Test func loupeUsesActualFittedImageAndPointerCoordinates() {
     let leftSlot = CGRect(x: 0, y: 0, width: 500, height: 600)
     let rightSlot = leftSlot.offsetBy(dx: 500, dy: 0)
@@ -33,7 +35,7 @@ private func aidTemporary() throws -> URL {
     #expect(enlarged.width == right.width * 8 && enlarged.height == right.height * 8)
     #expect(enlarged.minX + enlarged.width * 0.5 == lens.midX)
     #expect(enlarged.minY + enlarged.height * 0.25 == lens.midY)
-    // Backing scale affects decode resolution, never the point coordinate or 600pt lens size.
+    // 画面倍率はデコード解像度だけに反映し、ポイント座標や600ptのレンズ寸法は変えない。
     let metadata = ImageMetadata(width: 6000, height: 9000)
     #expect(CanvasGeometry.loupePixelSize(metadata: metadata, displayed: CGSize(width: 100, height: 150), backingScale: 1) == 1200)
     #expect(CanvasGeometry.loupePixelSize(metadata: metadata, displayed: CGSize(width: 100, height: 150), backingScale: 2) == 2400)
@@ -43,6 +45,7 @@ private func aidTemporary() throws -> URL {
     #expect(resized == CGRect(x: 225, y: 0, width: 150, height: 300))
 }
 
+// 全ソースで展開容量を共有し、解放した分を再利用できることを確認する。
 @Test func extractionBudgetCountsEveryLiveSourceAndReleasesSpace() throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let storage = try ExtractionStorage(root: root, capacity: 100)
@@ -57,6 +60,7 @@ private func aidTemporary() throws -> URL {
     try second.reserve(60); #expect(storage.byteCount == 100)
 }
 
+// 所有マーカーとロックを確認し、他プロセスの領域やリンク先を清掃しないことを確認する。
 @Test func orphanCleanupRespectsLocksMarkersAndSymlinks() throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let storage = try ExtractionStorage(root: root)
@@ -79,6 +83,7 @@ private func aidTemporary() throws -> URL {
     #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent(".owner").path))
 }
 
+// 同じソースの展開共有と、実ファイル置換時のキャッシュ失効を確認する。
 @Test func sourceCacheSharesExtractionAndInvalidatesReplacedFiles() async throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let archive = root.appendingPathComponent("book.zip")
@@ -95,15 +100,16 @@ private func aidTemporary() throws -> URL {
     let previous = try await cache.load(archive)
     let size = try previous.images.prefix(2).reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
     #expect(storage.byteCount == size)
-    // Atomic replacement with identical bytes/length still changes the inode and invalidates the key.
+    // 同じ内容・サイズで不可分に置換してもinodeが変わるため、キャッシュキーは失効する。
     try Data(contentsOf: archive).write(to: archive, options: .atomic)
     let replaced = try await cache.load(archive)
     #expect(replaced.temporaryDirectory!.url != previous.temporaryDirectory!.url)
-    // An externally retained old source remains readable until its last user releases it.
+    // 外部で保持中の旧ソースは、最後の利用者が解放するまで読み込める。
     #expect(FileManager.default.fileExists(atPath: previous.images[0].fileURL.path))
     #expect(storage.byteCount == size * 2)
 }
 
+// フォルダ変更の再読み込みと、保持件数を超えた際の古いソースの削除を確認する。
 @Test func sourceCacheRefreshesDirectoryAndEvictsLeastRecentlyUsed() async throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let cache = SourceCache(temporaryRoot: root.appendingPathComponent("cache"), countLimit: 2)
@@ -128,6 +134,7 @@ private func aidTemporary() throws -> URL {
     #expect(try await cache.load(dir).images.count == 1)
 }
 
+// 容量不足でも保持中の本を消さず、失敗した展開の容量予約が残らないことを確認する。
 @Test func fullDiskKeepsPinnedSourceAndFailedExtractionLeavesNoBytes() async throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let entries = try ArchiveReader.extract(aidFixture("images.zip"), into: root)
@@ -148,6 +155,7 @@ private func aidTemporary() throws -> URL {
     #expect(emptyStorage.byteCount == 0)
 }
 
+// 画像デコードの共有と、容量整理で先読み画像が先に削除されることを確認する。
 @Test func imageCacheSharesDecodeAndDropsSpeculationFirst() async throws {
     let cache = ImageCache()
     async let a = cache.image(at: aidFixture("portrait.png"), maxPixelSize: 1024, use: .prefetch)
@@ -166,6 +174,7 @@ private func aidTemporary() throws -> URL {
     #expect(await cache.byteCounts.display == 0)
 }
 
+// キャッシュ容量とは別に、1回のデコードにもメモリ上限があることを確認する。
 @Test func decoderHasSeparateMemoryBound() throws {
     #expect(throws: (any Error).self) {
         _ = try ImageDecoder.decode(at: aidFixture("portrait.png"), maxPixelSize: 8192, maximumBytes: 1)
@@ -174,6 +183,7 @@ private func aidTemporary() throws -> URL {
     #expect(image.byteCount <= 1024)
 }
 
+// 名前変更後のURLでも、既存の展開結果を再利用できることを確認する。
 @Test func archiveRenameKeepsCachedExtractionAtNewURL() async throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let old = root.appendingPathComponent("old.zip")
@@ -188,6 +198,7 @@ private func aidTemporary() throws -> URL {
     #expect(await cache.cachedCount == 1)
 }
 
+// 画像キャッシュが容量を守りながら、最近使ったページを保持することを確認する。
 @Test func imageLRURetainsRecentPageWithinByteBudget() async throws {
     let first = try ImageDecoder.decode(at: aidFixture("portrait.png"), maxPixelSize: 1024)
     let second = try ImageDecoder.decode(at: aidFixture("square.png"), maxPixelSize: 1024)
@@ -204,6 +215,7 @@ private func aidTemporary() throws -> URL {
     #expect(evicted.image !== square.image)
 }
 
+// ルーペと通常表示の画像が、共通のメモリ上限を守ることを確認する。
 @Test func loupeAndDisplayShareTheTotalMemoryBudget() async throws {
     let first = try ImageDecoder.decode(at: aidFixture("portrait.png"), maxPixelSize: 1024)
     let cache = ImageCache(capacity: first.byteCount, loupeCapacity: first.byteCount)

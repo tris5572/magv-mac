@@ -1,5 +1,6 @@
 import Foundation
 
+/// ウィンドウ矩形の保存形式。非有限値や無効な寸法を復元前に検出する。
 public struct WindowFrame: Codable, Equatable, Sendable {
     public var x: Double
     public var y: Double
@@ -16,6 +17,7 @@ public struct SavedWindow: Codable, Equatable, Sendable {
     public init(frame: WindowFrame) { self.frame = frame }
 }
 
+/// 永続化する表示設定。省略された項目は初期値で補い、形式のバージョンを持つ。
 public struct ReaderSettings: Codable, Equatable, Sendable {
     public var schemaVersion = 1
     public var displayMode: DisplayMode = .spread
@@ -32,6 +34,7 @@ public struct ReaderSettings: Codable, Equatable, Sendable {
     }
 }
 
+/// JSONで設定を保存する。破損・未対応形式では初期値への復帰を呼び出し側に任せる。
 public struct SettingsStore: Sendable {
     public let url: URL
     public init(url: URL) { self.url = url }
@@ -49,14 +52,16 @@ public struct SettingsStore: Sendable {
     }
 }
 
+/// 保存時とモニター構成が変わっても、ウィンドウを現在の表示可能領域に収める。
 public enum WindowPlacement {
     public static func restore(_ saved: WindowFrame, visibleFrames: [CGRect], minimumSize: CGSize) -> CGRect? {
         let screens = visibleFrames.filter { WindowFrame($0).isValid }
         guard saved.isValid, let primary = screens.first else { return nil }
-        // Bound dimensions before calculating intersections to avoid arithmetic overflow on damaged values.
+        // 壊れた保存値で演算があふれないよう、重なりの計算前に寸法を画面サイズ以下へ制限する。
         let probe = CGRect(x: saved.x, y: saved.y,
                            width: min(saved.width, screens.map(\.width).max()!),
                            height: min(saved.height, screens.map(\.height).max()!))
+        // 保存矩形との重なりが最大の画面を選び、重なりがなければ先頭の画面へ戻す。
         let screen = screens.max {
             intersectionArea(probe, $0) < intersectionArea(probe, $1)
         }.flatMap { intersectionArea(probe, $0) > 0 ? $0 : nil } ?? primary

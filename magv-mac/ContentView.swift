@@ -2,6 +2,7 @@ import SwiftUI
 import MagvCore
 import UniformTypeIdentifiers
 
+/// 閲覧画面。セッションの状態に応じてキャンバス・操作パネル・進捗・エラーを表示する。
 struct ContentView: View {
     @Bindable var session: ReaderSession
     let openPanel: () -> Void
@@ -23,6 +24,7 @@ struct ContentView: View {
                     }.frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 if session.source != nil {
+                    // 上端のホバー領域に入った間だけ操作パネルを表示する。
                     VStack(spacing: 0) {
                         VStack(spacing: 8) {
                             HStack(spacing: 8) {
@@ -75,6 +77,7 @@ struct ContentView: View {
                         }.padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)).padding(12)
                     }
                 }
+                // 短時間で終わるページ移動では進捗を出さず、表示のちらつきを避ける。
                 .task(id: session.isPreparingPage) {
                     showPageLoading = false
                     if session.isPreparingPage {
@@ -86,6 +89,7 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .frame(minWidth: 320, minHeight: 240)
+        // ドロップから受け取った最初のURLを、メインアクター上でセッションへ渡す。
         .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
@@ -103,6 +107,7 @@ struct ContentView: View {
     }
 }
 
+/// 開き方向に合わせた進捗表示。クリックとドラッグをページ番号へ変換する。
 private struct PageIndicator: View {
     @Bindable var session: ReaderSession
     var body: some View {
@@ -135,6 +140,7 @@ private struct PageIndicator: View {
     }
 }
 
+/// 再生間隔の入力を受け付け、セッションの共通ルールで検証して適用する。
 private struct SlideshowIntervalEditor: View {
     @Bindable var session: ReaderSession
     @State private var text = ""

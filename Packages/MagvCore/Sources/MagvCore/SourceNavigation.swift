@@ -1,5 +1,6 @@
 import Foundation
 
+/// 兄弟ソース一覧から移動先を選ぶ。端では停止し、ランダム選択では現在の本を除く。
 public enum SourceNavigator {
     public static func destination(_ command: SourceCommand, current: URL, siblings: [URL]) -> URL? {
         switch command {
@@ -12,6 +13,7 @@ public enum SourceNavigator {
     }
 }
 
+/// ファイル名やフォルダ名から検索語を作り、URLとして安全に符号化する。
 public enum SourceSearch {
     public static func url(for sourceURL: URL, kind: SourceKind) -> URL? {
         let name = kind == .archive ? sourceURL.deletingPathExtension().lastPathComponent : sourceURL.lastPathComponent
@@ -19,7 +21,7 @@ public enum SourceSearch {
         guard !query.isEmpty else { return nil }
         var components = URLComponents(string: "https://duckduckgo.com/")!
         components.queryItems = [URLQueryItem(name: "t", value: "h_"), URLQueryItem(name: "q", value: query)]
-        // A literal '+' must remain a plus when interpreted as a form query by the browser.
+        // ブラウザーがフォーム形式のクエリとして解釈しても、文字「+」が空白に化けないようにする。
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         return components.url
     }

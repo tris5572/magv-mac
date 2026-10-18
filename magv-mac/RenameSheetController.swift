@@ -1,7 +1,7 @@
 import AppKit
 import MagvCore
 
-/// The window supplies a field editor so a Return which commits IME text cannot also submit the form.
+/// IMEの変換確定に使うReturnで送信も実行されないよう、専用のフィールドエディターを使う。
 @MainActor final class RenameFieldEditor: NSTextView {
     private(set) var isCommittingComposition = false
     override func keyDown(with event: NSEvent) {
@@ -12,6 +12,7 @@ import MagvCore
     static func shouldSubmit(hasMarkedText: Bool, wasComposing: Bool) -> Bool { !hasMarkedText && !wasComposing }
 }
 
+/// 拡張子を保持した名前変更シート。送信中は入力を止め、失敗時は同じシートで再入力する。
 @MainActor final class RenameSheetController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     let panel: NSPanel
     private let editor = RenameFieldEditor()
@@ -43,7 +44,7 @@ import MagvCore
         for label in [previousLabel, nextLabel] { label.textColor = .secondaryLabelColor; label.lineBreakMode = .byTruncatingMiddle }
         submitButton.target = self; submitButton.action = #selector(confirm)
         cancelButton.target = self; cancelButton.action = #selector(cancel)
-        // Return/Escape are handled by the text input client, after the input method gets them.
+        // Return／Escapeは入力メソッドに渡した後、テキスト入力側で処理する。
         submitButton.bezelStyle = .rounded; cancelButton.bezelStyle = .rounded
         let spacer = NSView()
         let buttons = NSStackView(views: [spacer, cancelButton, submitButton]); buttons.orientation = .horizontal
@@ -71,6 +72,7 @@ import MagvCore
     }
     func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? { client as? NSTextField === nameField ? editor : nil }
 
+    // IMEの変換確定に使ったReturnと、確定済みの入力を送信するReturnを区別する。
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
             guard RenameFieldEditor.shouldSubmit(hasMarkedText: textView.hasMarkedText(), wasComposing: editor.isCommittingComposition) else { return true }
@@ -82,7 +84,7 @@ import MagvCore
 
     @objc private func confirm() {
         guard submitButton.isEnabled, !editor.hasMarkedText(), !editor.isCommittingComposition else { return }
-        // Return can arrive before the field editor commits its text to the control.
+        // Return時は入力欄への値の反映が間に合わない場合があるため、編集中の文字列を直接取得する。
         let baseName = nameField.currentEditor()?.string ?? nameField.stringValue
         nameField.stringValue = baseName
         setBusy(true); errorLabel.stringValue = ""

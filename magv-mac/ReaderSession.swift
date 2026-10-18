@@ -2,6 +2,7 @@ import AppKit
 import MagvCore
 import Observation
 
+/// 描画に必要なページ情報と画像をまとめた、準備済みの表示状態。
 struct PresentedPage {
     var sourceURL: URL
     let page: DisplayPage
@@ -9,9 +10,12 @@ struct PresentedPage {
     let failureNames: [Int: String]
 }
 
+/// 閲覧操作の窓口。読み込み・ページ移動・描画・先読みを連携させ、UIへ状態を公開する。
+/// UIの状態更新をメインアクターに集約し、展開やデコードは専用の処理へ委譲する。
 @MainActor @Observable final class ReaderSession {
     var source: LoadedSource?
     var page: DisplayPage?
+    // 移動先の page と、実際に描画する presentedPage を分け、準備中も直前の画面を維持する。
     private(set) var presentedPage: PresentedPage?
     var decoded: [Int: DecodedImage] { presentedPage?.images ?? [:] }
     var imageFailures: [Int: String] = [:]
@@ -55,6 +59,7 @@ struct PresentedPage {
     private let sourceCache: SourceCache
     private let wait: @Sendable (Duration) async throws -> Void
     private var slideshowTask: Task<Void, Never>?
+    // 各処理のIDは要求の世代を表す。キャンセル後に完了した古い処理の反映を防ぐ。
     private var slideshowID = UUID()
     private var slideshowSuspended = false
     private var prefetchTask: Task<Void, Never>?
@@ -65,9 +70,10 @@ struct PresentedPage {
     private var loupePixels = 0
     private var suppressPrefetch = false
     private var windowIsOpen = true
+    // 閲覧位置と最近使った項目は起動中だけ保持し、設定ファイルには保存しない。
     private var positions: [URL: Int] = [:]
     private struct ArchiveNeighbors { let previous: URL?; let next: URL? }
-    // Each successful open captures its own neighbors, independently of earlier renames.
+    // 開くたびに、その時点の隣接ソースを記録する。過去の名前変更による移動先を引き継がない。
     private var archiveNeighbors: ArchiveNeighbors?
     private var openTask: Task<Void, Never>?
     private var renderTask: Task<Void, Never>?
@@ -110,7 +116,9 @@ struct PresentedPage {
         return PageNavigator.move(command, from: page, orientations: orientations, mode: mode) != page
     }
 
+    /// 新しいソースを準備し、成功した時点で現在の本を置き換える。失敗時は元の表示を保つ。
     func open(_ url: URL, userSelection: Bool = true) {
+        // ファイル名変更の途中では切り替えず、変更結果に合わせたURLで後から開く。
         if isRenaming { deferredOpen = (url, userSelection); return }
         stopSlideshow(); cancelNavigation(); cancelPrefetch(exceptSource: url); clearLoupe()
         prefetchForward = true
@@ -135,10 +143,11 @@ struct PresentedPage {
                 try Task.checkCancellation()
                 guard let self, self.requestID == id else { return }
                 self.rememberPosition()
+                // 直接選択した画像を最優先し、それ以外は起動中に記録した閲覧位置から再開する。
                 let remembered = (userSelection ? loaded.initialIndex : nil) ?? self.positions[loaded.url] ?? 0
                 let index = min(max(0, remembered), loaded.images.count - 1)
                 let prepared = try await loaded.preparingPage(at: index, mode: self.mode)
-                // A prefetched/cached source may contain a directory listing from before a rename.
+                // 先読み・キャッシュに残る一覧が名前変更前の可能性があるため、アーカイブの兄弟一覧を取り直す。
                 let urls = prepared.kind == .archive
                     ? try? await Task.detached { try FileAccessService.siblings(of: prepared.url, kind: prepared.kind) }.value
                     : (prepared.needsParentAccess ? nil : prepared.siblings)
@@ -181,6 +190,7 @@ struct PresentedPage {
         return siblings.contains { FileAccessService.sameLocation($0, destination) }
     }
 
+    /// アーカイブの前後移動には、開いた時点で確定した隣接URLを使う。
     func sourceDestination(_ command: SourceCommand) -> URL? {
         guard let source else { return nil }
         if source.kind == .archive, let archiveNeighbors {
@@ -201,6 +211,7 @@ struct PresentedPage {
             authorizeParent { [weak self] in self?.switchSource(command) }
             return
         }
+        // 一覧更新で並び順が変わっても、予定していた移動先が消えた場合は別の本へ進めない。
         let planned = sourceDestination(command)
         let id = requestID
         neighborhoodTask?.cancel(); isSelectingSource = true
@@ -249,6 +260,7 @@ struct PresentedPage {
         }
     }
 
+    /// フォルダの許可取得後、要求元の本がまだ表示中であることを確認して操作を再開する。
     private func requestAccess(to directory: URL, reason: String, then action: @escaping () -> Void) {
         errorTitle = "フォルダへのアクセスを確認できませんでした"
         if fileAccess.covers(directory) { action(); return }
@@ -307,6 +319,7 @@ struct PresentedPage {
         }
     }
 
+    /// 実ファイルを変更し、表示・履歴・キャッシュ・保留中の要求が参照するURLを揃える。
     func renameArchive(to baseName: String, completion: @escaping (Result<Void, Error>) -> Void) {
         guard let source, source.kind == .archive, !isLoading, !isRenaming,
               fileAccess.covers(source.url.deletingLastPathComponent()) else { completion(.failure(ReaderError.permission)); return }
@@ -374,6 +387,7 @@ struct PresentedPage {
         navigationID = UUID(); navigationTask?.cancel(); navigationTask = nil
         navigationQueue.removeAll(); isPreparingPage = false
     }
+    /// アーカイブのページ移動を順番に処理し、連続入力でも相対移動の順序を保つ。
     private func enqueue(_ request: Navigation) {
         cancelSlideshowWait(); cancelPrefetch(finishingCurrentImage: true, exceptSource: source?.url); clearLoupe()
         navigationQueue.append(request)
@@ -398,6 +412,7 @@ struct PresentedPage {
                         case .last: needed = self.mode == .spread ? [current.images.count - 2, current.images.count - 1] : [current.images.count - 1]
                         }
                     }
+                    // 移動候補の縦横を先に調べて見開きを判定し、表示が決まった画像のファイルを保持する。
                     let metadata = try await current.preparingMetadata(at: needed)
                     guard !Task.isCancelled, self.navigationID == id else { return }
                     let orientations = metadata.images.enumerated().map { self.imageFailures[$0.offset] == nil ? $0.element.orientation : .unknown }
@@ -424,6 +439,7 @@ struct PresentedPage {
         }
     }
 
+    // 512px単位に切り上げ、ウィンドウの細かなリサイズによる再デコードを抑える。
     func updatePixelSize(_ size: Int) {
         let bucket = max(1024, min(8192, ((size + 511) / 512) * 512))
         guard bucket != pixelSize else { return }; pixelSize = bucket; render()
@@ -438,6 +454,7 @@ struct PresentedPage {
         } else { enqueue(.index(page.anchorIndex)) }
     }
 
+    /// 表示対象をデコードし、全枠の画像またはエラー表示が揃ってから描画状態を切り替える。
     private func render() {
         cancelSlideshowWait(); cancelPrefetch(finishingCurrentImage: true, exceptSource: source?.url); clearLoupe()
         renderTask?.cancel()
@@ -445,7 +462,7 @@ struct PresentedPage {
         guard let source, let page else { return }
         if page.visibleIndices.contains(source.images.count - 1) { stopSlideshow() }
         let indices = page.visibleIndices; let pixels = pixelSize
-        // Keep the previous complete frame until every slot in this page is ready.
+        // このページの全枠が揃うまでは、直前に完成した画面を表示し続ける。
         isDecoding = true
         renderTask = Task { [weak self, cache] in
             var result: [Int: DecodedImage] = [:]; var failures: [Int: String] = [:]
@@ -459,6 +476,7 @@ struct PresentedPage {
             withExtendedLifetime(source) {}
             guard !Task.isCancelled, let self, self.renderID == id else { return }
             self.imageFailures.merge(failures) { _, new in new }
+            // 読めない画像を見開きから外し、必要なら単体表示として組み直す。
             if !failures.isEmpty {
                 self.stopSlideshow()
                 let revised = PageNavigator.page(at: page.anchorIndex, orientations: self.orientations, mode: self.mode, forceSingle: page.forceSingle)
@@ -491,6 +509,7 @@ struct PresentedPage {
     func stopSlideshow() { isSlideshowPlaying = false; cancelSlideshowWait() }
     func suspendSlideshow() { slideshowSuspended = true; cancelSlideshowWait() }
     func resumeSlideshow() { slideshowSuspended = false; scheduleSlideshow() }
+    // ページの準備完了後から次の待機を開始する。編集・スリープ中は待機を保留する。
     private func scheduleSlideshow() {
         cancelSlideshowWait()
         guard isSlideshowPlaying, !isEditingInterval, !isPreparingPage else { return }
@@ -500,7 +519,7 @@ struct PresentedPage {
         slideshowTask = Task { [weak self, wait] in
             do { try await wait(delay) } catch { return }
             guard !Task.isCancelled, let self, self.slideshowID == id, self.isSlideshowPlaying else { return }
-            self.move(.next) // render completion starts a fresh wait; there is no catch-up loop.
+            self.move(.next) // 描画完了から改めて待機する。遅延分を取り戻す連続移動は行わない。
         }
     }
 
@@ -508,6 +527,7 @@ struct PresentedPage {
         loupeEnabled && canRead && !isRendering && !suppressPrefetch &&
         presentedPage?.sourceURL == source?.url && presentedPage?.page == page
     }
+    /// 表示サイズと画面倍率からルーペ用の解像度を求め、同じ要求の重複を避ける。
     func requestLoupe(index: Int, displayedSize: CGSize, backingScale: CGFloat) {
         guard canUseLoupe, let source, page?.visibleIndices.contains(index) == true,
               let metadata = source.images[index].metadata else { if loupeIndex != nil { clearLoupe() }; return }
@@ -527,8 +547,8 @@ struct PresentedPage {
     }
     private func cancelPrefetch(finishingCurrentImage: Bool = false, exceptSource: URL? = nil) {
         prefetchID = UUID()
-        // Let the current archive extraction finish so navigation can share it.
-        // The generation check prevents this task from starting any further images.
+        // 進行中の画像展開は完了させ、ページ移動でもその結果を共有できるようにする。
+        // 世代IDの検証により、それ以降の画像へ先読みが進むことを防ぐ。
         if !finishingCurrentImage { prefetchTask?.cancel() }
         prefetchTask = nil
         Task { [cache, sourceCache] in await cache.cancelPrefetch(); await sourceCache.cancelPrefetch(except: exceptSource) }
@@ -540,8 +560,8 @@ struct PresentedPage {
         let before = [page.anchorIndex - 2, page.anchorIndex - 1]
         let end = page.visibleIndices.last ?? page.anchorIndex
         let after = [end + 1, end + 2]
-        // Prepare the whole neighboring spread in reading order, favoring the last
-        // navigation direction instead of decoding the opposite side first after a jump.
+        // 直前の移動方向を優先し、隣の見開きを読む順番で準備する。
+        // ジャンプ直後も、反対側より進行方向の2枚を先にデコードする。
         let nearby = (prefetchForward ? after + before : before + after).filter { source.images.indices.contains($0) }
         prefetchTask = Task { [weak self, cache, sourceCache] in
             defer { if self?.prefetchID == id { self?.prefetchTask = nil } }
@@ -553,6 +573,7 @@ struct PresentedPage {
                 withExtendedLifetime(prepared) {}
             }
             guard let self, self.prefetchID == id else { return }
+            // 隣の本はフォルダの許可が既にある場合だけ先読みし、許可ダイアログは出さない。
             let adjacent = [self.sourceDestination(.next), self.sourceDestination(.previous)]
                 .compactMap { $0 }.filter { self.fileAccess.covers($0) }
             for url in adjacent {
@@ -568,6 +589,7 @@ struct PresentedPage {
             }
         }
     }
+    // メモリ不足時はルーペと先読みを止め、深刻度に応じてキャッシュを解放する。
     func handleMemoryPressure(critical: Bool) {
         suppressPrefetch = true; cancelPrefetch(); clearLoupe()
         let root = temporaryRoot
@@ -583,6 +605,7 @@ struct PresentedPage {
         stopSlideshow(); windowIsOpen = false; isEditingInterval = false
         cancelOpen(); clearLoupe(); renderTask?.cancel(); isDecoding = false
     }
+    // 終了時は進行中の処理と表示の参照を解放し、自分が所有する展開領域を清掃する。
     func shutdown() {
         closeWindow(); source = nil; presentedPage = nil; archiveNeighbors = nil
         Task { [cache, sourceCache] in await cache.removeAll(); await sourceCache.removeAll() }

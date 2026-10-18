@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-/// One byte budget for every live extraction, including sources still displayed during a switch.
+/// 切り替え中も表示している旧ソースを含め、全展開領域で1つの容量上限を共有する。
 public final class ExtractionStorage: @unchecked Sendable {
     public static let defaultRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("dev.tris.magv-native/Extraction", isDirectory: true)
@@ -21,6 +21,7 @@ public final class ExtractionStorage: @unchecked Sendable {
 
     public let root: URL
     public let capacity: Int64
+    // このロックの下で容量・ファイル・保持数をまとめて更新し、複数アクターから安全に使う。
     private let lock = NSLock()
     private var allocations: [URL: Int64] = [:]
     private var bytes: Int64 = 0
@@ -40,6 +41,7 @@ public final class ExtractionStorage: @unchecked Sendable {
     }
     public var byteCount: Int64 { lock.withLock { bytes } }
 
+    // 所有マーカーを書き込み、プロセス間ロックで利用中の展開領域を保護する。
     fileprivate func create() throws -> (URL, Int32) {
         try lock.withLock {
             let url = root.appendingPathComponent("magv-" + UUID().uuidString, isDirectory: true)
@@ -67,20 +69,21 @@ public final class ExtractionStorage: @unchecked Sendable {
     }
     fileprivate func release(_ url: URL, fd: Int32) {
         lock.withLock {
-            // Keep the process lock until removal finishes so a second instance cannot clean a live source.
+            // 削除完了までロックを維持し、別インスタンスが使用中のソースを清掃しないようにする。
             try? FileManager.default.removeItem(at: url)
             files = files.filter { $0.value.directory != url }
             bytes -= allocations.removeValue(forKey: url) ?? 0
             flock(fd, LOCK_UN); close(fd)
         }
     }
-    /// Called only at process exit, after cancelling all readers.
+    /// すべての読み込みへキャンセルを要求した後、プロセス終了時だけ呼び出す。
     public func cleanOwnedAtExit() {
         lock.withLock {
             for url in allocations.keys { try? FileManager.default.removeItem(at: url) }
             files.removeAll(); allocations.removeAll(); bytes = 0
         }
     }
+    // 書き込み前に容量を確保する。保持中の画像は除外し、先読み・古い画像の順に削除する。
     private func makeRoom(_ amount: Int64) throws {
         guard amount >= 0, amount <= capacity else { throw ReaderError.limit("一時ディスクキャッシュ全体2GiB") }
         while amount > capacity - bytes {
@@ -106,6 +109,7 @@ public final class ExtractionStorage: @unchecked Sendable {
             return ExtractionFileLease(id: id, url: url, directory: directory, storage: self)
         }
     }
+    // 完成済みファイルの保持数を増やし、リースの存続中は容量整理の対象から外す。
     fileprivate func pin(_ id: UUID, directory: TemporaryDirectory, speculative: Bool) -> ExtractionFileLease? {
         lock.withLock {
             guard var record = files[id], record.complete else { return nil }
@@ -123,6 +127,7 @@ public final class ExtractionStorage: @unchecked Sendable {
         }
     }
     fileprivate func seal(_ id: UUID) { lock.withLock { files[id]?.complete = true } }
+    // 最後の利用者が離れた未完成ファイルは、失敗・キャンセル後の残骸として削除する。
     fileprivate func unpin(_ id: UUID) {
         lock.withLock {
             guard files[id] != nil else { return }
@@ -136,6 +141,7 @@ public final class ExtractionStorage: @unchecked Sendable {
         }
     }
     public var cachedFileCount: Int { lock.withLock { files.count } }
+    /// 専用の名前・マーカー・取得可能なロックを確認し、異常終了で残った領域だけを清掃する。
     public static func cleanOrphans(in root: URL) {
         guard let urls = try? FileManager.default.contentsOfDirectory(at: root,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
@@ -157,6 +163,7 @@ public final class ExtractionStorage: @unchecked Sendable {
     }
 }
 
+/// ソースごとの展開領域。最後の参照がなくなるとディレクトリと容量予約を解放する。
 public final class TemporaryDirectory: @unchecked Sendable {
     public let url: URL
     private let storage: ExtractionStorage
@@ -174,7 +181,7 @@ public final class TemporaryDirectory: @unchecked Sendable {
     deinit { storage.release(url, fd: fd) }
 }
 
-/// A displayed page or decoder pins its file; only unpinned files are eligible for disk LRU eviction.
+/// 表示ページやデコーダーがファイルを保持し、保持されていないものだけをディスクLRUで削除する。
 public final class ExtractionFileLease: @unchecked Sendable {
     let id: UUID
     public let url: URL

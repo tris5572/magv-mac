@@ -3,7 +3,7 @@ import AppKit
 import CArchive
 import ImageIO
 
-// Compiled with the actual app's ReaderSession and InputRouter by test.sh.
+// test.shがアプリ本体のReaderSession・InputRouterと一緒にコンパイルする結合テスト。
 @main struct SessionSmoke {
     @MainActor static func main() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("magv-session-" + UUID().uuidString)
@@ -62,7 +62,7 @@ import ImageIO
             windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 115)!
         try require(InputRouter.command(for: home, direction: .rightToLeft) == .last, "RTL Home mapping failed")
         try require(InputRouter.command(for: home, direction: .leftToRight) == .first, "LTR Home mapping failed")
-        // Daily source switching preserves positions and stops at empty/deleted siblings.
+        // 日常のソース切替で閲覧位置を保ち、空・削除済みの兄弟ソースで適切に停止することを確認する。
         session.switchSource(.next); try await waitForOpen()
         try require(session.source?.url == folders[1], "Next sibling failed")
         session.switchSource(.previous); try await waitForOpen()
@@ -119,7 +119,7 @@ import ImageIO
         try require(try String(contentsOf: conflict, encoding: .utf8) == "existing bytes", "Bang prefix overwrote an existing file")
         try require(try Data(contentsOf: prefixed) == Data(contentsOf: fixture.appendingPathComponent("images.zip")), "Rename changed archive contents")
 
-        // An access panel response for an earlier book must never edit a later book.
+        // 前の本に対する許可ダイアログの応答で、後から開いた本を変更しないことを確認する。
         let permissionSession = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("other-cache"))
         permissionSession.open(prefixed)
         while permissionSession.isLoading || permissionSession.isRendering { try await Task.sleep(for: .milliseconds(5)) }
@@ -179,6 +179,7 @@ import ImageIO
     }
 }
 
+/// 指定した画像のデコードを止め、先読みと表示要求が重なる順序を再現する。
 private final class PageDecodeProbe: @unchecked Sendable {
     private let condition = NSCondition()
     private var blockedURL: URL?
@@ -201,6 +202,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     func resume() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
 }
 
+// セッションを通した先読み共有と、進行方向に沿ったデコード順序を検証する。
 @MainActor private func pagePrefetchSmoke(root: URL, fixture: URL) async throws {
     func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw NSError(domain: "PagePrefetchSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -217,8 +219,8 @@ private final class PageDecodeProbe: @unchecked Sendable {
     let data = try Data(contentsOf: fixture.appendingPathComponent("portrait.png"))
     for index in 0..<12 { try data.write(to: folder.appendingPathComponent("\(index).png")) }
 
-    // Pause a real speculative decode, then turn to that image before releasing it.
-    // This exercises the session's cancellation order, not just the cache in isolation.
+    // 実際の先読みデコードを一時停止し、再開前にその画像へページ移動する。
+    // キャッシュ単体に加えて、セッション側のキャンセル順序も検証する。
     for url in [folder, fixture.appendingPathComponent("images.zip")] {
         let probe = PageDecodeProbe(); defer { probe.resume() }
         let cache = ImageCache(decoder: { url, pixels, bytes in
@@ -247,7 +249,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
         try await waitFor("close \(url.lastPathComponent)") { !(await cache.isDecoding) }
     }
 
-    // After a cold jump, both images on the favored side must precede the other side.
+    // 未キャッシュ位置へのジャンプ後は、進行方向側の2枚を反対側より先に準備する。
     for forward in [true, false] {
         let probe = PageDecodeProbe(); defer { probe.resume() }
         let cache = ImageCache(decoder: { url, pixels, bytes in
@@ -276,6 +278,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     print("Page prefetch smoke passed: folder/archive decode handoff, forward/backward spread priority")
 }
 
+// 名前変更後も現在の本の移動先を維持し、次の本を開くと一覧を再評価することを確認する。
 @MainActor private func renameNavigationSmoke(root: URL, fixture: URL) async throws {
     func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw NSError(domain: "RenameNavigationSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -307,7 +310,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
         try result.get(); try await settle()
         return reader.source!.url
     }
-    // Cache B before renaming A, so opening B must refresh even a cached source's neighbors.
+    // Aの名前変更前にBをキャッシュし、Bを開く際にキャッシュ済みでも隣接一覧を更新することを確認する。
     reader.open(books[2]); try await settle(); reader.authorizeDirectory(directory)
     reader.open(books[1]); try await settle()
     _ = try await rename("zz-moved")
@@ -368,7 +371,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     print("Rename navigation smoke passed: A → rename → B → A's predecessor, fresh cached opens, per-open neighbors, repeated rename/bang/collision, refresh, additions/deletions, first/last")
 }
 
-// Opt-in: exercises AppKit's actual field editor and sheet without showing a reader window.
+// 追加指定時のみ、閲覧ウィンドウを表示せずAppKitの実際の入力エディターとシートを検証する。
 @MainActor private func renameSheetSmoke(root: URL, fixture: URL) async throws {
     _ = NSApplication.shared
     let directory = root.appendingPathComponent("rename-sheet", isDirectory: true)
@@ -446,6 +449,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     print("Rename sheet smoke passed: active field editor, Return/button, invalid-name retry, IME guard, on-disk rename")
 }
 
+// 準備中は旧画面を保ち、新しい見開きが揃った時点で表示をまとめて切り替えることを確認する。
 @MainActor private func pagePresentationSmoke(root: URL, fixture: URL, verifyCanvas: Bool) async throws {
     func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw NSError(domain: "PagePresentationSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
@@ -540,7 +544,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     print("Page presentation smoke passed: retained frame, atomic spread, rapid jumps, resize, failures, archive cancellation/source switch\(verifyCanvas ? ", canvas pixel comparison" : "")")
 }
 
-// Intentionally ignore cancellation here, so stale timer completions exercise the session's generation guard.
+// 意図的にキャンセルを無視し、古いタイマーの完了をセッションの世代IDで拒否できるか検証する。
 private actor SlideshowGate {
     private var next = 0
     private var waits: [Int: CheckedContinuation<Void, Error>] = [:]
@@ -556,6 +560,7 @@ private actor SlideshowGate {
     func drain() { for continuation in waits.values { continuation.resume() }; waits.removeAll() }
 }
 
+// 制御可能な時計で自動再生を進め、ルーペ・メモリ不足・停止操作との連携を検証する。
 @MainActor private func readingAidSmoke(root: URL, fixture: URL, folder: URL) async throws {
     let gate = SlideshowGate()
     let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("aid-cache"), wait: { try await gate.wait($0) })
@@ -678,6 +683,7 @@ private actor SlideshowGate {
     reader.closeWindow()
 }
 
+// 低いディスク上限のもとで、ページ単位の展開・連続移動・表示変更を検証する。
 @MainActor private func streamingNavigationSmoke(root: URL, fixture: URL) async throws {
     func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw NSError(domain: "StreamingSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
