@@ -50,7 +50,7 @@ struct PresentedPage {
     var willOpenSource: (() -> Void)?
     var requestDirectoryAccess: ((URL, String, @escaping (URL?) -> Void) -> Void)?
     let preferences: ReaderPreferencesStore
-    private let fileAccess = SessionFileAccess()
+    private let fileAccess: SessionFileAccess
     private let temporaryRoot: URL?
     private let sourceCache: SourceCache
     private let wait: @Sendable (Duration) async throws -> Void
@@ -89,6 +89,7 @@ struct PresentedPage {
         self.preferences = preferences
         self.temporaryRoot = temporaryRoot
         cache = imageCache
+        fileAccess = SessionFileAccess(bookmarkStore: preferences.directoryBookmarkStore)
         sourceCache = SourceCache(temporaryRoot: temporaryRoot)
         self.wait = wait
         mode = preferences.settings.displayMode
