@@ -58,6 +58,8 @@ struct PresentedPage {
     private var slideshowID = UUID()
     private var slideshowSuspended = false
     private var prefetchTask: Task<Void, Never>?
+    private var prefetchID = UUID()
+    private var prefetchForward = true
     private var loupeTask: Task<Void, Never>?
     private var loupeID = UUID()
     private var loupePixels = 0
@@ -78,13 +80,15 @@ struct PresentedPage {
     private var deferredOpen: (url: URL, userSelection: Bool)?
     private var requestID = UUID()
     private var renderID = UUID()
-    private let cache = ImageCache()
+    private let cache: ImageCache
     private var pixelSize = 2048
 
     init(preferences: ReaderPreferencesStore = ReaderPreferencesStore(), temporaryRoot: URL? = nil,
+         imageCache: ImageCache = ImageCache(),
          wait: @escaping @Sendable (Duration) async throws -> Void = { try await ContinuousClock().sleep(for: $0) }) {
         self.preferences = preferences
         self.temporaryRoot = temporaryRoot
+        cache = imageCache
         sourceCache = SourceCache(temporaryRoot: temporaryRoot)
         self.wait = wait
         mode = preferences.settings.displayMode
@@ -108,6 +112,7 @@ struct PresentedPage {
     func open(_ url: URL, userSelection: Bool = true) {
         if isRenaming { deferredOpen = (url, userSelection); return }
         stopSlideshow(); cancelNavigation(); cancelPrefetch(exceptSource: url); clearLoupe()
+        prefetchForward = true
         willOpenSource?(); isEditingName = false; isEditingInterval = false
         fileAccess.retain(url, asDirectoryGrant: userSelection)
         let inputURL = userSelection ? url : fileAccess.reopeningURL(for: url)
@@ -343,6 +348,7 @@ struct PresentedPage {
 
     func move(_ command: PageCommand) {
         guard canRead else { return }
+        prefetchForward = command != .previous && command != .previousImage && command != .last
         if source?.archive == nil {
             let next = PageNavigator.move(command, from: page, orientations: orientations, mode: mode)
             guard next != page else { scheduleSlideshow(); return }
@@ -353,6 +359,7 @@ struct PresentedPage {
 
     func jump(to index: Int) {
         guard canRead else { return }
+        prefetchForward = index >= (page?.anchorIndex ?? 0)
         cancelNavigation()
         if source?.archive == nil {
             page = PageNavigator.page(at: index, orientations: orientations, mode: mode)
@@ -367,7 +374,7 @@ struct PresentedPage {
         navigationQueue.removeAll(); isPreparingPage = false
     }
     private func enqueue(_ request: Navigation) {
-        cancelSlideshowWait(); cancelPrefetch(); clearLoupe()
+        cancelSlideshowWait(); cancelPrefetch(finishingCurrentImage: true, exceptSource: source?.url); clearLoupe()
         navigationQueue.append(request)
         guard navigationTask == nil else { return }
         let id = navigationID; isPreparingPage = true
@@ -431,7 +438,7 @@ struct PresentedPage {
     }
 
     private func render() {
-        cancelSlideshowWait(); cancelPrefetch(); clearLoupe()
+        cancelSlideshowWait(); cancelPrefetch(finishingCurrentImage: true, exceptSource: source?.url); clearLoupe()
         renderTask?.cancel()
         let id = UUID(); renderID = id
         guard let source, let page else { return }
@@ -517,33 +524,43 @@ struct PresentedPage {
     func clearLoupe() {
         loupeID = UUID(); loupeTask?.cancel(); loupeTask = nil; loupeIndex = nil; loupeImage = nil; loupePixels = 0
     }
-    private func cancelPrefetch(exceptSource: URL? = nil) {
-        prefetchTask?.cancel(); prefetchTask = nil
+    private func cancelPrefetch(finishingCurrentImage: Bool = false, exceptSource: URL? = nil) {
+        prefetchID = UUID()
+        // Let the current archive extraction finish so navigation can share it.
+        // The generation check prevents this task from starting any further images.
+        if !finishingCurrentImage { prefetchTask?.cancel() }
+        prefetchTask = nil
         Task { [cache, sourceCache] in await cache.cancelPrefetch(); await sourceCache.cancelPrefetch(except: exceptSource) }
     }
     private func prefetch() {
-        guard !suppressPrefetch, canRead, !isRendering, let source, let page else { return }
-        prefetchTask?.cancel()
-        let id = renderID; let pixels = pixelSize; let mode = mode
-        let nearby = Set(page.visibleIndices.flatMap { [$0 - 2, $0 - 1, $0 + 1, $0 + 2] })
-            .filter { source.images.indices.contains($0) && !page.visibleIndices.contains($0) }
-            .sorted { abs($0 - page.anchorIndex) < abs($1 - page.anchorIndex) }
-        let adjacent = [sourceDestination(.next), sourceDestination(.previous)]
-            .compactMap { $0 }.filter { fileAccess.covers($0) }
+        guard !suppressPrefetch, canRead, !isRendering, prefetchTask == nil, let source, let page else { return }
+        let id = UUID(); prefetchID = id
+        let pixels = pixelSize; let mode = mode
+        let before = [page.anchorIndex - 2, page.anchorIndex - 1]
+        let end = page.visibleIndices.last ?? page.anchorIndex
+        let after = [end + 1, end + 2]
+        // Prepare the whole neighboring spread in reading order, favoring the last
+        // navigation direction instead of decoding the opposite side first after a jump.
+        let nearby = (prefetchForward ? after + before : before + after).filter { source.images.indices.contains($0) }
         prefetchTask = Task { [weak self, cache, sourceCache] in
+            defer { if self?.prefetchID == id { self?.prefetchTask = nil } }
             for index in nearby {
-                guard !Task.isCancelled, self?.renderID == id else { return }
+                guard !Task.isCancelled, self?.prefetchID == id else { return }
                 guard let prepared = try? await source.preparingImages(at: [index], prefetch: true), !Task.isCancelled else { return }
+                guard self?.prefetchID == id else { return }
                 _ = try? await cache.image(at: prepared.images[index].fileURL, maxPixelSize: pixels, use: .prefetch, retaining: prepared)
                 withExtendedLifetime(prepared) {}
             }
+            guard let self, self.prefetchID == id else { return }
+            let adjacent = [self.sourceDestination(.next), self.sourceDestination(.previous)]
+                .compactMap { $0 }.filter { self.fileAccess.covers($0) }
             for url in adjacent {
-                guard !Task.isCancelled, self?.renderID == id else { return }
+                guard !Task.isCancelled, self.prefetchID == id else { return }
                 guard let neighbor = try? await sourceCache.load(url, prefetch: true, mode: mode) else { continue }
-                guard !Task.isCancelled, self?.renderID == id else { return }
+                guard !Task.isCancelled, self.prefetchID == id else { return }
                 let first = PageNavigator.page(at: 0, orientations: neighbor.images.map(\.orientation), mode: mode)
                 for index in first?.visibleIndices ?? [] {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self.prefetchID == id else { return }
                     _ = try? await cache.image(at: neighbor.images[index].fileURL, maxPixelSize: pixels, use: .prefetch, retaining: neighbor)
                 }
                 withExtendedLifetime(neighbor) {}

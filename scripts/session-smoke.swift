@@ -1,5 +1,5 @@
 import AppKit
-import MagvCore
+@testable import MagvCore
 import CArchive
 import ImageIO
 
@@ -172,10 +172,108 @@ import ImageIO
         try await streamingNavigationSmoke(root: root, fixture: fixture)
         try await readingAidSmoke(root: root, fixture: fixture, folder: folders[0])
         try await pagePresentationSmoke(root: root, fixture: fixture, verifyCanvas: CommandLine.arguments.contains("--ui"))
+        try await pagePrefetchSmoke(root: root, fixture: fixture)
         try await renameNavigationSmoke(root: root, fixture: fixture)
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
         if CommandLine.arguments.contains("--ui") { try await renameSheetSmoke(root: root, fixture: fixture) }
     }
+}
+
+private final class PageDecodeProbe: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var blockedURL: URL?
+    private var released = false
+    private var began = false
+    private var requests: [URL] = []
+    var started: Bool { condition.lock(); defer { condition.unlock() }; return began }
+    var decodedURLs: [URL] { condition.lock(); defer { condition.unlock() }; return requests }
+    func block(_ url: URL) { condition.lock(); blockedURL = url; condition.unlock() }
+    func record(_ url: URL) throws {
+        condition.lock(); defer { condition.unlock() }
+        requests.append(url)
+        guard url == blockedURL else { return }
+        began = true
+        let deadline = Date().addingTimeInterval(5)
+        while !released {
+            guard condition.wait(until: deadline) else { throw ReaderError.archive("Prefetch probe timed out") }
+        }
+    }
+    func resume() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+
+@MainActor private func pagePrefetchSmoke(root: URL, fixture: URL) async throws {
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "PagePrefetchSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    func waitFor(_ phase: @autoclosure () -> String, _ condition: () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await condition()) {
+            try require(ContinuousClock.now < deadline, "Page prefetch timed out: \(phase())")
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+    let folder = root.appendingPathComponent("prefetch-pages", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let data = try Data(contentsOf: fixture.appendingPathComponent("portrait.png"))
+    for index in 0..<12 { try data.write(to: folder.appendingPathComponent("\(index).png")) }
+
+    // Pause a real speculative decode, then turn to that image before releasing it.
+    // This exercises the session's cancellation order, not just the cache in isolation.
+    for url in [folder, fixture.appendingPathComponent("images.zip")] {
+        let probe = PageDecodeProbe(); defer { probe.resume() }
+        let cache = ImageCache(decoder: { url, pixels, bytes in
+            try probe.record(url)
+            return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        })
+        let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent(UUID().uuidString), imageCache: cache)
+        defer { reader.shutdown() }
+        reader.mode = .single; reader.handleMemoryPressure(critical: false)
+        reader.open(url)
+        try await waitFor("open \(url.lastPathComponent)") { !reader.isLoading && !reader.isRendering }
+        let target = reader.source!.images[1].fileURL.standardizedFileURL
+        probe.block(target)
+        reader.memoryPressureEnded(); reader.updatePixelSize(2560)
+        try await waitFor("prefetch start \(url.lastPathComponent), target=\(target), decoded=\(probe.decodedURLs), canRead=\(reader.canRead), rendering=\(reader.isRendering)") { probe.started }
+        reader.move(.next)
+        try await waitFor("display handoff \(url.lastPathComponent)") {
+            let count = await cache.pendingRequestCount
+            return reader.page?.anchorIndex == 1 && count == 1
+        }
+        probe.resume()
+        try await waitFor("display finish \(url.lastPathComponent)") { !reader.isRendering }
+        try require(reader.presentedPage?.page.anchorIndex == 1 && reader.decoded[1] != nil, "Prefetch did not become the displayed page")
+        try require(probe.decodedURLs.filter { $0 == target }.count == 1, "Session decoded the active prefetch twice")
+        reader.closeWindow()
+        try await waitFor("close \(url.lastPathComponent)") { !(await cache.isDecoding) }
+    }
+
+    // After a cold jump, both images on the favored side must precede the other side.
+    for forward in [true, false] {
+        let probe = PageDecodeProbe(); defer { probe.resume() }
+        let cache = ImageCache(decoder: { url, pixels, bytes in
+            try probe.record(url)
+            return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        })
+        let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent(UUID().uuidString), imageCache: cache)
+        defer { reader.shutdown() }
+        reader.mode = .spread; reader.handleMemoryPressure(critical: false)
+        reader.open(folder)
+        try await waitFor("spread open") { !reader.isLoading && !reader.isRendering }
+        if !forward { reader.jump(to: 10); try await waitFor("jump to end") { !reader.isRendering } }
+        reader.jump(to: forward ? 4 : 6)
+        try await waitFor("cold jump") { !reader.isRendering }
+        let indices = forward ? [6, 7, 2, 3] : [4, 5, 8, 9]
+        let expected = indices.map { reader.source!.images[$0].fileURL.standardizedFileURL }
+        probe.block(expected[0])
+        reader.memoryPressureEnded(); reader.updatePixelSize(2560)
+        try await waitFor("spread prefetch start, forward=\(forward)") { probe.started }
+        probe.resume()
+        try await waitFor("spread prefetch finish, forward=\(forward)") { expected.allSatisfy { probe.decodedURLs.contains($0) } }
+        try require(probe.decodedURLs.filter { expected.contains($0) } == expected, "Prefetch did not prioritize the neighboring spread in navigation order")
+        reader.closeWindow()
+        try await waitFor("spread close") { !(await cache.isDecoding) }
+    }
+    print("Page prefetch smoke passed: folder/archive decode handoff, forward/backward spread priority")
 }
 
 @MainActor private func renameNavigationSmoke(root: URL, fixture: URL) async throws {

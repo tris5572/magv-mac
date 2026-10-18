@@ -188,18 +188,72 @@ func indexRetainsZIPNamesAndZIP64(_ name: String) throws {
 
 private final class DecodeGate: @unchecked Sendable {
     private let condition = NSCondition()
-    private var began = false
+    private var calls = 0
     private var released = false
-    var started: Bool { condition.lock(); defer { condition.unlock() }; return began }
+    var started: Bool { count > 0 }
+    var count: Int { condition.lock(); defer { condition.unlock() }; return calls }
     func pause() throws {
         condition.lock(); defer { condition.unlock() }
-        began = true
+        calls += 1
         let deadline = Date().addingTimeInterval(5)
         while !released {
             guard condition.wait(until: deadline) else { throw ReaderError.archive("Decode gate timed out") }
         }
     }
     func resume() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+
+@Test(arguments: [false, true])
+func pageTurnReusesActiveOrCompletedPrefetch(_ cancelConsumer: Bool) async throws {
+    for finishBeforeDisplay in [false, true] {
+        let gate = DecodeGate(); defer { gate.resume() }
+        let cache = ImageCache(decoder: { url, pixels, bytes in
+            try gate.pause()
+            return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        })
+        let url = streamingFixture("portrait.png")
+        let speculative = Task { try await cache.image(at: url, maxPixelSize: 1024, use: .prefetch) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !gate.started, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(gate.started)
+        if cancelConsumer { speculative.cancel() } else { await cache.cancelPrefetch() }
+        do { _ = try await speculative.value; Issue.record("Cancelled prefetch returned an image") } catch is CancellationError { }
+        #expect(await cache.pendingRequestCount == 0)
+        if finishBeforeDisplay {
+            gate.resume()
+            while await cache.isDecoding, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            #expect(await cache.isDecoding == false)
+        }
+        let display = Task { try await cache.image(at: url, maxPixelSize: 1024) }
+        if !finishBeforeDisplay {
+            while await cache.pendingRequestCount == 0, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+            #expect(await cache.pendingRequestCount == 1)
+            gate.resume()
+        }
+        let image = try await display.value
+        let reused = try await cache.image(at: url, maxPixelSize: 1024)
+        #expect(image.image === reused.image)
+        #expect(gate.count == 1, "Page turn decoded the prefetched image again")
+    }
+}
+
+@Test(arguments: [false, true])
+func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
+    let gate = DecodeGate(); defer { gate.resume() }
+    let cache = ImageCache(decoder: { url, pixels, bytes in
+        try gate.pause()
+        return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+    })
+    let speculative = Task { try await cache.image(at: streamingFixture("portrait.png"), maxPixelSize: 1024, use: .prefetch) }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+    while !gate.started, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+    #expect(gate.started)
+    if removeAll { await cache.removeAll() } else { await cache.memoryPressure(critical: false) }
+    do { _ = try await speculative.value; Issue.record("Discarded prefetch returned an image") } catch is CancellationError { }
+    gate.resume()
+    while await cache.isDecoding, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+    #expect(await cache.isDecoding == false)
+    #expect(await cache.byteCounts.display == 0)
 }
 
 @Test func cancelledPrefetchKeepsFilePinnedUntilDecoderActuallyFinishes() async throws {

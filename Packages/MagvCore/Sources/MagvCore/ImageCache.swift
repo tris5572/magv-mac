@@ -66,7 +66,9 @@ public actor ImageCache {
     }
     private func cancelWaiter(_ key: Key, consumer: UUID) {
         guard var work = pending[key], let waiter = work.waiters.removeValue(forKey: consumer) else { return }
-        pending[key] = work.waiters.isEmpty ? nil : work
+        // Image I/O cannot stop an active decode. Keep it shareable across a page turn,
+        // even when the prefetch consumer leaves before the display consumer arrives.
+        pending[key] = work.waiters.isEmpty && work.id != active ? nil : work
         waiter.continuation.resume(throwing: CancellationError())
     }
 
@@ -116,12 +118,19 @@ public actor ImageCache {
         if key.highResolution { highResolutionBytes -= value.image.byteCount } else { bytes -= value.image.byteCount }
     }
     public func cancelPrefetch() {
+        cancelPrefetch(keepingActive: true)
+    }
+    private func cancelPrefetch(keepingActive: Bool) {
         for key in pending.keys where pending[key]?.use == .prefetch {
-            if let work = pending.removeValue(forKey: key) { for waiter in work.waiters.values { waiter.continuation.resume(throwing: CancellationError()) } }
+            guard var work = pending[key] else { continue }
+            let waiters = work.waiters.values
+            work.waiters.removeAll()
+            pending[key] = keepingActive && work.id == active ? work : nil
+            for waiter in waiters { waiter.continuation.resume(throwing: CancellationError()) }
         }
     }
     public func memoryPressure(critical: Bool) {
-        cancelPrefetch()
+        cancelPrefetch(keepingActive: false)
         for key in pending.keys where key.highResolution {
             if let work = pending.removeValue(forKey: key) { for waiter in work.waiters.values { waiter.continuation.resume(throwing: CancellationError()) } }
         }
