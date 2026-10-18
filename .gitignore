@@ -4,3 +4,24 @@ build/
 DerivedData/
 .swiftpm/
 *.xcresult
+
+# Xcodeの個人設定と作業状態
+xcuserdata/
+*.xcuserstate
+
+# ローカルの環境変数と認証情報（共有用の雛形は除外しない）
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# 秘密鍵・署名証明書・プロビジョニングプロファイル
+*.key
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.p8
+id_rsa
+id_ed25519
