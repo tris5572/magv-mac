@@ -179,27 +179,30 @@ import ImageIO
     }
 }
 
-/// 指定した画像のデコードを止め、先読みと表示要求が重なる順序を再現する。
+/// 指定した画像のデコードを止め、先読みと連続した表示要求の順序を確認する。
 private final class PageDecodeProbe: @unchecked Sendable {
     private let condition = NSCondition()
-    private var blockedURL: URL?
-    private var released = false
+    private var blockedURLs: Set<URL> = []
     private var began = false
     private var requests: [URL] = []
     var started: Bool { condition.lock(); defer { condition.unlock() }; return began }
     var decodedURLs: [URL] { condition.lock(); defer { condition.unlock() }; return requests }
-    func block(_ url: URL) { condition.lock(); blockedURL = url; condition.unlock() }
+    func block(_ url: URL) { condition.lock(); blockedURLs.insert(url); condition.unlock() }
     func record(_ url: URL) throws {
         condition.lock(); defer { condition.unlock() }
         requests.append(url)
-        guard url == blockedURL else { return }
+        guard blockedURLs.contains(url) else { return }
         began = true
         let deadline = Date().addingTimeInterval(5)
-        while !released {
+        while blockedURLs.contains(url) {
             guard condition.wait(until: deadline) else { throw ReaderError.archive("Prefetch probe timed out") }
         }
     }
-    func resume() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+    func resume(_ url: URL? = nil) {
+        condition.lock()
+        if let url { blockedURLs.remove(url) } else { blockedURLs.removeAll() }
+        condition.broadcast(); condition.unlock()
+    }
 }
 
 // セッションを通した先読み共有と、進行方向に沿ったデコード順序を検証する。
@@ -229,6 +232,15 @@ private final class PageDecodeProbe: @unchecked Sendable {
         })
         let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent(UUID().uuidString), imageCache: cache)
         defer { reader.shutdown() }
+        let canvas = CanvasView(session: reader)
+        func scroll(_ amount: Int32, at timestamp: UInt64, units: CGScrollEventUnit = .line,
+                    phase: CGScrollPhase? = nil, momentum: CGMomentumScrollPhase = .none) {
+            let event = CGEvent(scrollWheelEvent2Source: nil, units: units, wheelCount: 1, wheel1: amount, wheel2: 0, wheel3: 0)!
+            event.timestamp = timestamp
+            if let phase { event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue)) }
+            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum.rawValue))
+            canvas.scrollWheel(with: NSEvent(cgEvent: event)!)
+        }
         reader.mode = .single; reader.handleMemoryPressure(critical: false)
         reader.open(url)
         try await waitFor("open \(url.lastPathComponent)") { !reader.isLoading && !reader.isRendering }
@@ -236,15 +248,46 @@ private final class PageDecodeProbe: @unchecked Sendable {
         probe.block(target)
         reader.memoryPressureEnded(); reader.updatePixelSize(2560)
         try await waitFor("prefetch start \(url.lastPathComponent), target=\(target), decoded=\(probe.decodedURLs), canRead=\(reader.canRead), rendering=\(reader.isRendering)") { probe.started }
-        reader.move(.next)
+        scroll(-1, at: 10_000_000_000)
         try await waitFor("display handoff \(url.lastPathComponent)") {
             let count = await cache.pendingRequestCount
             return reader.page?.anchorIndex == 1 && count == 1
         }
+        // 先読みを引き継いだ移動と、その直後の移動を別々に止めて中間ページを確認する。
+        let following = reader.source!.images[2].fileURL.standardizedFileURL
+        probe.block(following)
+        scroll(-1, at: 10_050_000_000)
+        try require(!reader.isPreparingPage && reader.page?.anchorIndex == 1 && reader.presentedPage?.page.anchorIndex == 0,
+                    "Queued input interrupted the first page turn")
+        probe.resume(target)
+        try await waitFor("queued next page \(url.lastPathComponent)") { probe.decodedURLs.contains(following) }
+        try require(reader.page?.anchorIndex == 2 && reader.presentedPage?.page.anchorIndex == 1 && reader.decoded[1] != nil,
+                    "The queued page turn started before the first page was presented")
         probe.resume()
         try await waitFor("display finish \(url.lastPathComponent)") { !reader.isRendering }
-        try require(reader.presentedPage?.page.anchorIndex == 1 && reader.decoded[1] != nil, "Prefetch did not become the displayed page")
+        try require(reader.presentedPage?.page.anchorIndex == 2 && reader.decoded[2] != nil, "Two rapid wheel events did not advance two pages")
         try require(probe.decodedURLs.filter { $0 == target }.count == 1, "Session decoded the active prefetch twice")
+        scroll(1, at: 10_100_000_000)
+        scroll(1, at: 10_150_000_000)
+        try await waitFor("queued previous pages") { !reader.isRendering }
+        try require(reader.presentedPage?.page.anchorIndex == 0, "Two rapid wheel events did not turn back two pages")
+        // 位相のない高精度スクロールでも微小入力は抑え、ジェスチャーと慣性は合計1回に抑える。
+        scroll(-1, at: 10_160_000_000, units: .pixel)
+        scroll(-1, at: 10_180_000_000, units: .pixel)
+        try require(!reader.isRendering, "Small precise scroll deltas should not turn the page")
+        scroll(-12, at: 10_200_000_000, units: .pixel, phase: .began)
+        try require(!reader.isRendering, "A gesture should accumulate enough movement before turning the page")
+        scroll(-12, at: 10_220_000_000, units: .pixel, phase: .changed)
+        scroll(-24, at: 10_240_000_000, units: .pixel, phase: .changed)
+        scroll(-24, at: 10_260_000_000, units: .pixel, momentum: .begin)
+        try await waitFor("gesture page") { !reader.isRendering }
+        try require(reader.presentedPage?.page.anchorIndex == 1, "One scroll gesture should advance exactly one page")
+        // 先頭で行き止まる入力を混ぜて、前後の予約が入力順に実行されることを確認する。
+        scroll(1, at: 10_300_000_000)
+        scroll(1, at: 10_320_000_000)
+        scroll(-1, at: 10_340_000_000)
+        try await waitFor("mixed wheel direction") { !reader.isRendering }
+        try require(reader.presentedPage?.page.anchorIndex == 1, "Queued wheel directions were processed out of order at the first page")
         reader.closeWindow()
         try await waitFor("close \(url.lastPathComponent)") { !(await cache.isDecoding) }
     }
@@ -275,7 +318,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
         reader.closeWindow()
         try await waitFor("spread close") { !(await cache.isDecoding) }
     }
-    print("Page prefetch smoke passed: folder/archive decode handoff, forward/backward spread priority")
+    print("Page prefetch smoke passed: folder/archive decode handoff, queued wheel turns and gestures, forward/backward spread priority")
 }
 
 // 名前変更後も現在の本の移動先を維持し、次の本を開くと一覧を再評価することを確認する。

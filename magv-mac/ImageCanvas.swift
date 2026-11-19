@@ -24,7 +24,7 @@ struct ImageCanvas: NSViewRepresentable {
     let session: ReaderSession
     private var wheelAmount: CGFloat = 0
     private var wheelTurned = false
-    private var lastWheelTime: TimeInterval = 0
+    private var lastPreciseScrollTime: TimeInterval = 0
     // 配置計算を左上原点に統一し、画像そのものを描くときだけ上下を反転する。
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -131,16 +131,16 @@ struct ImageCanvas: NSViewRepresentable {
     override func scrollWheel(with event: NSEvent) {
         guard event.momentumPhase.isEmpty, abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX), session.canRead else { return }
         // AppKitがシステムのスクロール方向を反映済みで、負の差分は下方向を表す。
-        let now = event.timestamp
-        // トラックパッドは移動量を積算して1ジェスチャー1回、通常ホイールは時間で抑制する。
+        // 高精度スクロールは移動量を積算し、通常ホイールは1イベントずつ移動キューに渡す。
         if event.hasPreciseScrollingDeltas {
-            if event.phase.contains(.began) || now - lastWheelTime > 0.35 { wheelAmount = 0; wheelTurned = false }
-            lastWheelTime = now
+            let now = event.timestamp
+            if event.phase.contains(.began) || now - lastPreciseScrollTime > 0.35 { wheelAmount = 0; wheelTurned = false }
+            lastPreciseScrollTime = now
             guard !wheelTurned else { return }
             wheelAmount += event.scrollingDeltaY
             if abs(wheelAmount) >= 24 { session.move(wheelAmount < 0 ? .next : .previous); wheelTurned = true }
-        } else if now - lastWheelTime > 0.12 {
-            lastWheelTime = now; session.move(event.scrollingDeltaY < 0 ? .next : .previous)
+        } else {
+            session.move(event.scrollingDeltaY < 0 ? .next : .previous)
         }
     }
 

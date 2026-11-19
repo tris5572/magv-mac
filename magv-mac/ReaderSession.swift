@@ -80,7 +80,7 @@ struct PresentedPage {
     private enum Navigation { case command(PageCommand), index(Int) }
     private var navigationTask: Task<Void, Never>?
     private var navigationID = UUID()
-    private var navigationQueue: [Navigation] = []
+    private var navigationQueue: [PageCommand] = []
     private var neighborhoodTask: Task<Void, Never>?
     private var renameTask: Task<Void, Never>?
     private var deferredOpen: (url: URL, userSelection: Bool)?
@@ -112,7 +112,9 @@ struct PresentedPage {
     var pageLabel: String { guard let source, let page else { return "- / -" }; return "\(page.anchorIndex + 1) / \(source.images.count)" }
 
     func canMove(_ command: PageCommand) -> Bool {
-        guard canRead else { return false }
+        guard canRead, let source, source.images.count > 1 else { return false }
+        // 準備中や予約済みの移動によって、現在は端でも操作できるようになる。
+        if isPreparingPage || !navigationQueue.isEmpty { return true }
         return PageNavigator.move(command, from: page, orientations: orientations, mode: mode) != page
     }
 
@@ -362,13 +364,27 @@ struct PresentedPage {
 
     func move(_ command: PageCommand) {
         guard canRead else { return }
-        prefetchForward = command != .previous && command != .previousImage && command != .last
-        if source?.archive == nil {
+        navigationQueue.append(command)
+        advanceNavigation()
+    }
+
+    /// 表示が確定してから、最新のページを基準に予約済みの移動を順番に実行する。
+    private func advanceNavigation() {
+        guard !isRendering else { return }
+        while canRead, !navigationQueue.isEmpty {
+            let command = navigationQueue.removeFirst()
+            prefetchForward = command != .previous && command != .previousImage && command != .last
+            if source?.archive != nil {
+                prepareArchiveNavigation(.command(command))
+                return
+            }
             let next = PageNavigator.move(command, from: page, orientations: orientations, mode: mode)
-            guard next != page else { scheduleSlideshow(); return }
-            page = next; rememberPosition(); render(); hideCursor?(); return
+            guard next != page else { continue }
+            page = next; rememberPosition(); render(); hideCursor?()
+            return
         }
-        enqueue(.command(command))
+        navigationQueue.removeAll()
+        scheduleSlideshow(); prefetch()
     }
 
     func jump(to index: Int) {
@@ -379,7 +395,7 @@ struct PresentedPage {
             page = PageNavigator.page(at: index, orientations: orientations, mode: mode)
             rememberPosition(); render(); hideCursor?(); return
         }
-        enqueue(.index(index))
+        prepareArchiveNavigation(.index(index))
     }
 
     func cancelPageLoad() { stopSlideshow(); cancelNavigation() }
@@ -387,55 +403,54 @@ struct PresentedPage {
         navigationID = UUID(); navigationTask?.cancel(); navigationTask = nil
         navigationQueue.removeAll(); isPreparingPage = false
     }
-    /// アーカイブのページ移動を順番に処理し、連続入力でも相対移動の順序を保つ。
-    private func enqueue(_ request: Navigation) {
+    private func prepareArchiveNavigation(_ request: Navigation) {
+        guard let current = source, let previous = page else { return }
         cancelSlideshowWait(); cancelPrefetch(finishingCurrentImage: true, exceptSource: source?.url); clearLoupe()
-        navigationQueue.append(request)
-        guard navigationTask == nil else { return }
         let id = navigationID; isPreparingPage = true
         navigationTask = Task { [weak self] in
-            while !Task.isCancelled, let self, self.navigationID == id, !self.navigationQueue.isEmpty {
-                let request = self.navigationQueue.removeFirst()
-                guard let current = self.source, let previous = self.page else { break }
-                do {
-                    let needed: [Int]
-                    switch request {
-                    case .index(let index):
-                        let anchor = min(max(0, index), current.images.count - 1); needed = self.mode == .spread ? [anchor, anchor + 1] : [anchor]
-                    case .command(let command):
-                        switch command {
-                        case .next: let next = (previous.visibleIndices.last ?? previous.anchorIndex) + 1; needed = self.mode == .spread ? [next, next + 1] : [next]
-                        case .nextImage: needed = self.mode == .spread ? [previous.anchorIndex + 1, previous.anchorIndex + 2] : [previous.anchorIndex + 1]
-                        case .previous: needed = self.mode == .spread ? [previous.anchorIndex - 2, previous.anchorIndex - 1, previous.anchorIndex] : [previous.anchorIndex - 1]
-                        case .previousImage: needed = self.mode == .spread ? [previous.anchorIndex - 1, previous.anchorIndex] : [previous.anchorIndex - 1]
-                        case .first: needed = self.mode == .spread ? [0, 1] : [0]
-                        case .last: needed = self.mode == .spread ? [current.images.count - 2, current.images.count - 1] : [current.images.count - 1]
-                        }
-                    }
-                    // 移動候補の縦横を先に調べて見開きを判定し、表示が決まった画像のファイルを保持する。
-                    let metadata = try await current.preparingMetadata(at: needed)
-                    guard !Task.isCancelled, self.navigationID == id else { return }
-                    let orientations = metadata.images.enumerated().map { self.imageFailures[$0.offset] == nil ? $0.element.orientation : .unknown }
-                    let next: DisplayPage?
-                    switch request {
-                    case .index(let index): next = PageNavigator.page(at: index, orientations: orientations, mode: self.mode)
-                    case .command(let command): next = PageNavigator.move(command, from: previous, orientations: orientations, mode: self.mode)
-                    }
-                    guard let next else { continue }
-                    if case .command = request, next == previous { self.source = metadata; continue }
-                    let prepared = try await metadata.preparingImages(at: next.visibleIndices)
-                    guard !Task.isCancelled, self.navigationID == id else { return }
-                    self.source = prepared; self.page = next; self.rememberPosition(); self.render(); self.hideCursor?()
-                } catch is CancellationError { if Task.isCancelled { return } }
-                catch {
-                    guard !Task.isCancelled, self.navigationID == id else { return }
-                    self.navigationQueue.removeAll(); self.stopSlideshow()
-                    self.errorTitle = "ページを読み込めませんでした"; self.errorMessage = error.localizedDescription
+            guard !Task.isCancelled, let self, self.navigationID == id else { return }
+            defer {
+                if self.navigationID == id {
+                    self.navigationTask = nil; self.isPreparingPage = false
+                    self.advanceNavigation()
                 }
             }
-            guard let self, self.navigationID == id else { return }
-            self.navigationTask = nil; self.isPreparingPage = false
-            if !self.isDecoding { self.scheduleSlideshow(); self.prefetch() }
+            do {
+                let needed: [Int]
+                switch request {
+                case .index(let index):
+                    let anchor = min(max(0, index), current.images.count - 1); needed = self.mode == .spread ? [anchor, anchor + 1] : [anchor]
+                case .command(let command):
+                    switch command {
+                    case .next: let next = (previous.visibleIndices.last ?? previous.anchorIndex) + 1; needed = self.mode == .spread ? [next, next + 1] : [next]
+                    case .nextImage: needed = self.mode == .spread ? [previous.anchorIndex + 1, previous.anchorIndex + 2] : [previous.anchorIndex + 1]
+                    case .previous: needed = self.mode == .spread ? [previous.anchorIndex - 2, previous.anchorIndex - 1, previous.anchorIndex] : [previous.anchorIndex - 1]
+                    case .previousImage: needed = self.mode == .spread ? [previous.anchorIndex - 1, previous.anchorIndex] : [previous.anchorIndex - 1]
+                    case .first: needed = self.mode == .spread ? [0, 1] : [0]
+                    case .last: needed = self.mode == .spread ? [current.images.count - 2, current.images.count - 1] : [current.images.count - 1]
+                    }
+                }
+                // 移動候補の縦横を先に調べて見開きを判定し、表示が決まった画像のファイルを保持する。
+                let metadata = try await current.preparingMetadata(at: needed)
+                guard !Task.isCancelled, self.navigationID == id else { return }
+                let orientations = metadata.images.enumerated().map { self.imageFailures[$0.offset] == nil ? $0.element.orientation : .unknown }
+                let next: DisplayPage?
+                switch request {
+                case .index(let index): next = PageNavigator.page(at: index, orientations: orientations, mode: self.mode)
+                case .command(let command): next = PageNavigator.move(command, from: previous, orientations: orientations, mode: self.mode)
+                }
+                guard let next else { return }
+                if case .command = request, next == previous { self.source = metadata; return }
+                let prepared = try await metadata.preparingImages(at: next.visibleIndices)
+                guard !Task.isCancelled, self.navigationID == id else { return }
+                self.source = prepared; self.page = next; self.rememberPosition(); self.render(); self.hideCursor?()
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, self.navigationID == id else { return }
+                self.navigationQueue.removeAll(); self.stopSlideshow()
+                self.errorTitle = "ページを読み込めませんでした"; self.errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -451,7 +466,7 @@ struct PresentedPage {
         cancelNavigation()
         if source?.archive == nil {
             self.page = PageNavigator.page(at: page.anchorIndex, orientations: orientations, mode: mode); render()
-        } else { enqueue(.index(page.anchorIndex)) }
+        } else { prepareArchiveNavigation(.index(page.anchorIndex)) }
     }
 
     /// 表示対象をデコードし、全枠の画像またはエラー表示が揃ってから描画状態を切り替える。
@@ -485,7 +500,7 @@ struct PresentedPage {
             self.presentedPage = PresentedPage(sourceURL: self.source?.url ?? source.url, page: page, images: result,
                 failureNames: Dictionary(uniqueKeysWithValues: failures.keys.map { ($0, source.images[$0].name) }))
             self.isDecoding = false
-            self.scheduleSlideshow(); self.prefetch()
+            self.advanceNavigation()
         }
     }
 
