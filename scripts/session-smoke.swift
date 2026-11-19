@@ -398,7 +398,18 @@ private final class PageDecodeProbe: @unchecked Sendable {
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480), styleMask: [.titled], backing: .buffered, defer: false)
     window.isReleasedWhenClosed = false
     defer { window.close() }
+    let longName = String(repeating: "長い名前 abc ", count: 10) + "a.b"
     func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+    func requireHorizontalScrolling(_ editor: NSTextView, in field: NSTextField) throws {
+        try require(editor.string == longName, "Field editor did not preserve the full filename")
+        let end = editor.string.utf16.count
+        editor.scrollRangeToVisible(NSRange(location: 0, length: 1))
+        let start = editor.visibleRect.origin
+        editor.scrollRangeToVisible(NSRange(location: end - 1, length: 1))
+        let finish = editor.visibleRect.origin
+        try require(editor.frame.width > field.bounds.width && finish.x > start.x && finish.y == start.y,
+                    "Long filename did not scroll horizontally on one line")
+    }
     func exercise(button: Bool, attempts: [(String, Bool)]) async throws {
         guard let source = session.source else { throw ReaderError.missing }
         var submitted: String?
@@ -415,6 +426,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
         guard let field = views.compactMap({ $0 as? NSTextField }).first(where: \.isEditable),
               let change = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == "変更" }),
               let editor = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing field editor") }
+        if source.url.deletingPathExtension().lastPathComponent == longName { try requireHorizontalScrolling(editor, in: field) }
         editor.setMarkedText("未確定", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
         editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
         try require(submitted == nil && !finished, "IME composition submitted a rename")
@@ -426,6 +438,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
             sheet.panel.makeFirstResponder(field)
             guard let active = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing retry editor") }
             active.insertText(name, replacementRange: NSRange(location: 0, length: active.string.utf16.count))
+            if name == longName { try requireHorizontalScrolling(active, in: field) }
             if button { change.performClick(nil) }
             else { active.doCommand(by: #selector(NSResponder.insertNewline(_:))) }
             try await settle { result != nil }
@@ -444,9 +457,9 @@ private final class PageDecodeProbe: @unchecked Sendable {
             }
         }
     }
-    try await exercise(button: false, attempts: [("日本語 a.b", true)])
+    try await exercise(button: false, attempts: [(longName, true)])
     try await exercise(button: true, attempts: [("invalid/name", false), ("変更ボタンで確定", true)])
-    print("Rename sheet smoke passed: active field editor, Return/button, invalid-name retry, IME guard, on-disk rename")
+    print("Rename sheet smoke passed: horizontal scrolling, Return/button, invalid-name retry, IME guard, on-disk rename")
 }
 
 // 準備中は旧画面を保ち、新しい見開きが揃った時点で表示をまとめて切り替えることを確認する。

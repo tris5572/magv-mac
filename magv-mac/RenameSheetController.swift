@@ -32,6 +32,7 @@ import MagvCore
         editor.isFieldEditor = true
         nameField.stringValue = source.url.deletingPathExtension().lastPathComponent
         nameField.delegate = self; nameField.font = .systemFont(ofSize: 15)
+        nameField.cell?.isScrollable = true
         nameField.setAccessibilityLabel("アーカイブの名前（拡張子を除く）")
         errorLabel.textColor = .systemRed; errorLabel.font = .systemFont(ofSize: 12)
         errorLabel.setAccessibilityLabel("名前変更のエラー")
