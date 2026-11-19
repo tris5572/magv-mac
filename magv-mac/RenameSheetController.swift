@@ -48,7 +48,7 @@ import MagvCore
         submitButton.bezelStyle = .rounded; cancelButton.bezelStyle = .rounded
         let spacer = NSView()
         let buttons = NSStackView(views: [spacer, cancelButton, submitButton]); buttons.orientation = .horizontal
-        let stack = NSStackView(views: [title, previousLabel, nextLabel, input, errorLabel, buttons])
+        let stack = NSStackView(views: [title, previousLabel, input, nextLabel, errorLabel, buttons])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
         let content = panel.contentView!; content.addSubview(stack)
