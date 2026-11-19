@@ -14,56 +14,69 @@ import MagvCore
 
 /// 拡張子を保持した名前変更シート。送信中は入力を止め、失敗時は同じシートで再入力する。
 @MainActor final class RenameSheetController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
+    private static let contentWidth: CGFloat = 460
+    private let padding: CGFloat = 20
     let panel: NSPanel
     private let editor = RenameFieldEditor()
     private let nameField = NSTextField()
     private let errorLabel = NSTextField(wrappingLabelWithString: "")
     private let submitButton = NSButton(title: "変更", target: nil, action: nil)
     private let cancelButton = NSButton(title: "キャンセル", target: nil, action: nil)
+    private let stack = NSStackView()
     private let submit: (String, @escaping (Result<Void, Error>) -> Void) -> Void
     private let finished: () -> Void
 
     init(source: LoadedSource, previous: String?, next: String?,
          submit: @escaping (String, @escaping (Result<Void, Error>) -> Void) -> Void, finished: @escaping () -> Void) {
         self.submit = submit; self.finished = finished
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 460, height: 240), styleMask: [.titled], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.contentWidth, height: 0), styleMask: [.titled], backing: .buffered, defer: false)
         super.init()
         panel.title = "名前を変更"; panel.delegate = self; panel.isReleasedWhenClosed = false
         editor.isFieldEditor = true
-        nameField.stringValue = source.url.deletingPathExtension().lastPathComponent
         nameField.delegate = self; nameField.font = .systemFont(ofSize: 15)
         nameField.cell?.isScrollable = true
+        // 既存のファイル名に改行が含まれていても、入力欄は空欄時の1行の高さを使う。
+        nameField.heightAnchor.constraint(equalToConstant: nameField.intrinsicContentSize.height).isActive = true
+        nameField.stringValue = source.url.deletingPathExtension().lastPathComponent
         nameField.setAccessibilityLabel("アーカイブの名前（拡張子を除く）")
         errorLabel.textColor = .systemRed; errorLabel.font = .systemFont(ofSize: 12)
         errorLabel.setAccessibilityLabel("名前変更のエラー")
-        let title = NSTextField(labelWithString: "アーカイブの名前を変更")
-        title.font = .boldSystemFont(ofSize: 16)
         let extensionLabel = NSTextField(labelWithString: "." + source.url.pathExtension)
         let input = NSStackView(views: [nameField, extensionLabel]); input.orientation = .horizontal
-        let previousLabel = NSTextField(labelWithString: "前: " + (previous ?? "なし"))
-        let nextLabel = NSTextField(labelWithString: "次: " + (next ?? "なし"))
-        for label in [previousLabel, nextLabel] { label.textColor = .secondaryLabelColor; label.lineBreakMode = .byTruncatingMiddle }
+        func neighborLabel(_ filename: String, accessibilityLabel: String) -> NSTextField {
+            let label = NSTextField(labelWithString: String(filename.map { $0.isNewline ? " " : $0 }))
+            label.textColor = .secondaryLabelColor; label.lineBreakMode = .byTruncatingMiddle
+            label.setAccessibilityLabel(accessibilityLabel)
+            return label
+        }
         submitButton.target = self; submitButton.action = #selector(confirm)
         cancelButton.target = self; cancelButton.action = #selector(cancel)
         // Return／Escapeは入力メソッドに渡した後、テキスト入力側で処理する。
         submitButton.bezelStyle = .rounded; cancelButton.bezelStyle = .rounded
         let spacer = NSView()
         let buttons = NSStackView(views: [spacer, cancelButton, submitButton]); buttons.orientation = .horizontal
-        let stack = NSStackView(views: [title, previousLabel, input, nextLabel, errorLabel, buttons])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
+        if let previous { stack.addArrangedSubview(neighborLabel(previous, accessibilityLabel: "前のファイル")) }
+        stack.addArrangedSubview(input)
+        if let next { stack.addArrangedSubview(neighborLabel(next, accessibilityLabel: "次のファイル")) }
+        stack.addArrangedSubview(errorLabel)
+        stack.addArrangedSubview(buttons)
+        let rowWidth = Self.contentWidth - 2 * padding
+        errorLabel.preferredMaxLayoutWidth = rowWidth
+        NSLayoutConstraint.activate(stack.arrangedSubviews.map { $0.widthAnchor.constraint(equalToConstant: rowWidth) })
+        errorLabel.isHidden = true
         let content = panel.contentView!; content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            input.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            previousLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            nextLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            errorLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            buttons.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: padding),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -padding),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: padding)
         ])
+        resizeToFit()
+    }
+
+    private func resizeToFit() {
+        panel.setContentSize(NSSize(width: Self.contentWidth, height: ceil(stack.fittingSize.height) + 2 * padding))
     }
 
     func present(on window: NSWindow) {
@@ -88,14 +101,16 @@ import MagvCore
         // Return時は入力欄への値の反映が間に合わない場合があるため、編集中の文字列を直接取得する。
         let baseName = nameField.currentEditor()?.string ?? nameField.stringValue
         nameField.stringValue = baseName
-        setBusy(true); errorLabel.stringValue = ""
+        setBusy(true); errorLabel.isHidden = true
+        resizeToFit()
         submit(baseName) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success: self.dismiss()
             case .failure(let error):
                 self.setBusy(false); self.errorLabel.stringValue = error.localizedDescription
-                self.panel.setContentSize(NSSize(width: 460, height: 300))
+                self.errorLabel.isHidden = false
+                self.resizeToFit()
                 self.panel.makeFirstResponder(self.nameField)
                 NSAccessibility.post(element: self.errorLabel, notification: .valueChanged)
             }

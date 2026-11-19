@@ -419,7 +419,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     _ = NSApplication.shared
     let directory = root.appendingPathComponent("rename-sheet", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    let original = directory.appendingPathComponent("original.a.ZIP")
+    let original = directory.appendingPathComponent("original.a" + String(repeating: "\nX", count: 80) + ".ZIP")
     let bytes = try Data(contentsOf: fixture.appendingPathComponent("images.zip"))
     try bytes.write(to: original)
     let session = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: directory.appendingPathComponent("cache"))
@@ -453,22 +453,37 @@ private final class PageDecodeProbe: @unchecked Sendable {
         try require(editor.frame.width > field.bounds.width && finish.x > start.x && finish.y == start.y,
                     "Long filename did not scroll horizontally on one line")
     }
-    func exercise(button: Bool, attempts: [(String, Bool)]) async throws {
+    func exercise(button: Bool, previous: String? = nil, next: String? = nil, attempts: [(String, Bool)]) async throws {
         guard let source = session.source else { throw ReaderError.missing }
         var submitted: String?
         var result: Result<Void, Error>?
         var finished = false
         session.isEditingName = true
-        let sheet = RenameSheetController(source: source, previous: nil, next: nil, submit: { name, completion in
+        let sheet = RenameSheetController(source: source, previous: previous, next: next, submit: { name, completion in
             submitted = name
             session.renameArchive(to: name) { value in result = value; completion(value) }
         }, finished: { finished = true; session.isEditingName = false })
         sheet.present(on: window)
         defer { sheet.dismiss() }
-        let views = descendants(sheet.panel.contentView!)
+        let content = sheet.panel.contentView!
+        let views = descendants(content)
         guard let field = views.compactMap({ $0 as? NSTextField }).first(where: \.isEditable),
               let change = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == "変更" }),
               let editor = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing field editor") }
+        func requireBottomPadding() throws {
+            content.layoutSubtreeIfNeeded()
+            let buttonFrame = content.convert(change.bounds, from: change)
+            let bottomPadding = content.isFlipped ? content.bounds.maxY - buttonFrame.maxY : buttonFrame.minY - content.bounds.minY
+            try require(abs(bottomPadding - 20) <= 1, "Rename sheet has extra space below the buttons: \(bottomPadding) pt")
+        }
+        let labels = views.compactMap { $0 as? NSTextField }.filter { !$0.isEditable && !$0.isHiddenOrHasHiddenAncestor }
+        let expectedLabels = [previous, "." + source.url.pathExtension, next?.replacingOccurrences(of: "\n", with: " ")].compactMap { $0 }
+        try require(labels.map(\.stringValue).sorted() == expectedLabels.sorted(), "Rename sheet has unexpected labels")
+        try requireBottomPadding()
+        let singleLineHeight = NSTextField(labelWithString: ".ZIP").intrinsicContentSize.height
+        try require(labels.allSatisfy { $0.frame.height <= singleLineHeight + 1 }, "A filename label took up multiple lines")
+        try require(field.frame.height <= 30, "The name field took up multiple lines")
+        try require(field.stringValue == source.url.deletingPathExtension().lastPathComponent, "The name field changed the original filename")
         if source.url.deletingPathExtension().lastPathComponent == longName { try requireHorizontalScrolling(editor, in: field) }
         editor.setMarkedText("未確定", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
         editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
@@ -494,15 +509,20 @@ private final class PageDecodeProbe: @unchecked Sendable {
                 try require(try Data(contentsOf: newURL) == bytes, "Renamed file is missing or changed")
                 try require(session.source?.url == newURL && session.presentedPage?.sourceURL == newURL && session.title == newURL.lastPathComponent && session.page == oldPage,
                             "Rename sheet lost reader identity or page")
-            case .failure:
+            case .failure(let error):
                 try require(!succeeds && !finished && field.isEnabled && field.stringValue == name, "Failed rename lost the edited name")
                 try require(session.source?.url == oldURL && (try Data(contentsOf: oldURL)) == bytes, "Failed rename changed the file")
+                try require(descendants(content).compactMap { $0 as? NSTextField }.contains {
+                    !$0.isHiddenOrHasHiddenAncestor && $0.stringValue == error.localizedDescription
+                }, "Rename error label is missing")
+                try requireBottomPadding()
             }
         }
     }
-    try await exercise(button: false, attempts: [(longName, true)])
+    let multilineNeighbor = String(repeating: "X\n", count: 125) + ".zip"
+    try await exercise(button: false, previous: "前のファイル.zip", next: multilineNeighbor, attempts: [(longName, true)])
     try await exercise(button: true, attempts: [("invalid/name", false), ("変更ボタンで確定", true)])
-    print("Rename sheet smoke passed: horizontal scrolling, Return/button, invalid-name retry, IME guard, on-disk rename")
+    print("Rename sheet smoke passed: filename labels, bottom padding, horizontal scrolling, Return/button, invalid-name retry, IME guard, on-disk rename")
 }
 
 // 準備中は旧画面を保ち、新しい見開きが揃った時点で表示をまとめて切り替えることを確認する。
