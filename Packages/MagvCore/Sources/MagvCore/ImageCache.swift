@@ -6,7 +6,8 @@ public enum ImageUse: Int, Sendable { case prefetch, loupe, display }
 /// 1つのデコーダーで表示要求を先読みより優先し、同じキーへの要求は処理を共有する。
 public actor ImageCache {
     // 更新情報と要求解像度もキーに含め、変更前の画像や別サイズの結果と混同しない。
-    private struct Key: Hashable, Sendable { let url: URL; let revision: FileRevision; let pixels: Int; let highResolution: Bool }
+    private enum Revision: Hashable, Sendable { case file(FileRevision), memory(UUID) }
+    private struct Key: Hashable, Sendable { let url: URL; let revision: Revision; let pixels: Int; let highResolution: Bool }
     private struct Value { let image: DecodedImage; var touched: UInt64; var use: ImageUse }
     private struct Waiter {
         let continuation: CheckedContinuation<DecodedImage, Error>
@@ -15,6 +16,7 @@ public actor ImageCache {
     }
     private struct Pending {
         let id: UUID; let order: UInt64
+        let extraction: ExtractionFileLease?
         var waiters: [UUID: Waiter]
         var use: ImageUse { waiters.values.max { $0.use.rawValue < $1.use.rawValue }?.use ?? .prefetch }
     }
@@ -26,20 +28,24 @@ public actor ImageCache {
     private var highResolutionBytes = 0
     private let capacity: Int
     private let loupeCapacity: Int
-    typealias Decode = @Sendable (URL, Int, Int) throws -> DecodedImage
+    typealias Decode = @Sendable (ImageInput, Int, Int) throws -> DecodedImage
     private let decode: Decode
     public init(capacity: Int = 256 * 1024 * 1024, loupeCapacity: Int = 64 * 1024 * 1024) {
         self.capacity = max(0, capacity); self.loupeCapacity = min(max(0, capacity), max(0, loupeCapacity))
-        decode = { try ImageDecoder.decode(at: $0, maxPixelSize: $1, maximumBytes: $2) }
+        decode = { try ImageDecoder.decode($0, maxPixelSize: $1, maximumBytes: $2) }
     }
     init(decoder: @escaping Decode) {
         capacity = 256 * 1024 * 1024; loupeCapacity = 64 * 1024 * 1024; decode = decoder
     }
 
-    /// 先読みの待機が途中でキャンセルされても、実際のデコード完了までは展開ファイルを保持する。
+    /// アーカイブ画像には準備済みソースを渡す。展開データは実デコード完了まで保持する。
     public func image(at url: URL, maxPixelSize: Int, use: ImageUse = .display, retaining source: LoadedSource? = nil) async throws -> DecodedImage {
         try Task.checkCancellation()
-        let key = Key(url: url.standardizedFileURL, revision: try FileRevision.read(url),
+        let extraction = source?.extraction(at: url)
+        let revision: Revision
+        if let extraction, extraction.isInMemory { revision = .memory(extraction.id) }
+        else { revision = .file(try FileRevision.read(url)) }
+        let key = Key(url: url.standardizedFileURL, revision: revision,
                       pixels: max(1, min(maxPixelSize, 8192)), highResolution: use == .loupe)
         clock &+= 1
         if var value = values[key] {
@@ -56,7 +62,7 @@ public actor ImageCache {
                 if var work = pending[key] {
                     work.waiters[consumer] = waiter; pending[key] = work
                 } else {
-                    pending[key] = Pending(id: UUID(), order: clock, waiters: [consumer: waiter])
+                    pending[key] = Pending(id: UUID(), order: clock, extraction: extraction, waiters: [consumer: waiter])
                 }
                 startNext()
             }
@@ -82,11 +88,19 @@ public actor ImageCache {
         }) else { return }
         let key = next.key; let id = next.value.id
         active = id
+        let extraction = next.value.extraction
         let owners = next.value.waiters.values.compactMap(\.owner)
         Task.detached(priority: next.value.use == .prefetch ? .utility : .userInitiated) { [decode] in
             let result = withExtendedLifetime(owners) { Result {
-                let image = try decode(key.url, key.pixels, key.highResolution ? 64 * 1024 * 1024 : 128 * 1024 * 1024)
-                guard try FileRevision.read(key.url) == key.revision else { throw ReaderError.sourceChanged }
+                var input = ImageInput(url: key.url)
+                if case .memory = key.revision {
+                    guard let data = extraction?.data else { throw CancellationError() }
+                    input.data = data
+                }
+                let image = try decode(input, key.pixels, key.highResolution ? 64 * 1024 * 1024 : 128 * 1024 * 1024)
+                if case .file(let revision) = key.revision, try FileRevision.read(key.url) != revision {
+                    throw ReaderError.sourceChanged
+                }
                 return image
             } }
             await self.finish(key, id: id, result: result)

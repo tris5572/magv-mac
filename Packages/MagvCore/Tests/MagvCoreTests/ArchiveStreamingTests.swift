@@ -37,45 +37,91 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     var later = png; later.append(Data(repeating: 0, count: 8 * 1024 * 1024))
     let zip = root.appendingPathComponent("large.zip")
     try makeZIP(zip, files: [("10.png", later), ("2.png", png), ("1.png", png)])
-    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: Int64(png.count * 3))
-    let cache = SourceCache(storage: storage)
+    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: Int64(png.count * 3),
+                                        memoryCapacity: Int64(png.count * 3))
+    let cache = SourceCache(storage: storage, cacheArchiveImagesInMemory: true)
     let source = try await cache.load(zip)
     #expect(source.images.map(\.name) == ["1.png", "2.png", "10.png"])
     #expect(source.images.prefix(2).allSatisfy { $0.metadata?.orientation == .portrait })
     #expect(source.images[2].metadata == nil && !FileManager.default.fileExists(atPath: source.images[2].fileURL.path))
-    #expect(storage.byteCount == Int64(png.count * 2))
+    #expect(storage.memoryByteCount == Int64(png.count * 2))
+    #expect(storage.byteCount == 0)
+    #expect(!FileManager.default.fileExists(atPath: source.temporaryDirectory!.url.path))
     #expect(await source.archive?.extractionCount == 2)
     // 後続画像がディスク上限を超えていても、最初の見開きは開ける。
     await #expect(throws: ReaderError.limit("一時ディスクキャッシュ全体2GiB")) { _ = try await source.preparingImages(at: [2]) }
-    #expect(storage.byteCount == Int64(png.count * 2))
-    #expect(source.images.prefix(2).allSatisfy { FileManager.default.fileExists(atPath: $0.fileURL.path) })
+    #expect(storage.memoryByteCount == Int64(png.count * 2) && storage.byteCount == 0)
+    let decoded = try await ImageCache().image(at: source.images[0].fileURL, maxPixelSize: 1024, retaining: source)
+    #expect(decoded.image.height > decoded.image.width)
 }
 
-// 読み終えた画像を順に削除し、展開総量がディスク上限を超える本も読み進められることを確認する。
-@Test func pageDiskLRUAllowsReadingBeyondItsTotalCapacity() async throws {
+// 表示中の画像がメモリ枠を使い切っていても、次の画像を一時ファイルから表示できる。
+@Test func pinnedMemoryContentsSpillNextImageToDisk() async throws {
+    let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
+    let png = try Data(contentsOf: streamingFixture("portrait.png"))
+    let zip = root.appendingPathComponent("spilling.zip")
+    try makeZIP(zip, files: [("1.png", png), ("2.png", png)])
+    let size = Int64(png.count)
+    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: size, memoryCapacity: size)
+    let source = try SourceLoader.load(zip, storage: storage, cacheArchiveImagesInMemory: true)
+    let prepared = try await source.preparingImages(at: [0, 1])
+    let first = prepared.images[0].fileURL
+    let second = prepared.images[1].fileURL
+    #expect(prepared.extraction(at: first)?.data == png)
+    #expect(!FileManager.default.fileExists(atPath: first.path))
+    #expect(try Data(contentsOf: second) == png)
+    #expect(storage.memoryByteCount == size && storage.byteCount == size)
+    let cache = ImageCache()
+    let decoded = try await cache.image(at: second, maxPixelSize: 1024, retaining: prepared)
+    #expect(decoded.image.height > decoded.image.width)
+}
+
+@Test func memoryPressureRoutesNewPagesToDiskUntilNormal() async throws {
+    let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
+    let storage = try ExtractionStorage(root: root)
+    let source = try SourceLoader.load(streamingFixture("images.zip"), storage: storage, cacheArchiveImagesInMemory: true)
+    let first = try await source.preparingImages(at: [0])
+    storage.setMemoryPressure(true)
+    storage.trimFiles()
+    let second = try await source.preparingImages(at: [1])
+    #expect(first.extraction(at: first.images[0].fileURL)?.data != nil)
+    #expect(FileManager.default.fileExists(atPath: second.images[1].fileURL.path))
+    storage.setMemoryPressure(false)
+    let third = try await source.preparingImages(at: [2])
+    #expect(third.extraction(at: third.images[2].fileURL)?.data != nil)
+    #expect(!FileManager.default.fileExists(atPath: third.images[2].fileURL.path))
+}
+
+// 読み終えた画像を順に解放し、展開総量が上限を超える本も読み進められることを確認する。
+@Test(arguments: [false, true])
+func pageLRUAllowsReadingBeyondItsTotalCapacity(_ memory: Bool) async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let png = try Data(contentsOf: streamingFixture("portrait.png"))
     let zip = root.appendingPathComponent("many.zip")
     try makeZIP(zip, files: (1...40).reversed().map { ("\($0).png", png) })
-    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: Int64(png.count * 3))
-    let source = try SourceLoader.load(zip, storage: storage)
+    let budget = Int64(png.count * 3)
+    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: memory ? 0 : budget,
+                                        memoryCapacity: memory ? budget : 0)
+    let source = try SourceLoader.load(zip, storage: storage, cacheArchiveImagesInMemory: memory)
     #expect(storage.byteCount == 0)
     for index in source.images.indices {
         let prepared = try await source.preparingImages(at: [index])
-        #expect(try Data(contentsOf: prepared.images[index].fileURL) == png)
-        #expect(storage.byteCount <= storage.capacity && storage.cachedFileCount <= 3)
+        let url = prepared.images[index].fileURL
+        #expect(try (prepared.extraction(at: url)?.data ?? Data(contentsOf: url)) == png)
+        #expect(storage.byteCount + storage.memoryByteCount <= budget && storage.cachedFileCount <= 3)
         withExtendedLifetime(prepared) {}
     }
     #expect(!FileManager.default.fileExists(atPath: source.images[0].fileURL.path))
     let revisited = try await source.preparingImages(at: [0])
-    #expect(try Data(contentsOf: revisited.images[0].fileURL) == png)
+    let url = revisited.images[0].fileURL
+    #expect(try (revisited.extraction(at: url)?.data ?? Data(contentsOf: url)) == png)
     #expect(await source.archive?.extractionCount == 41)
 }
 
 // 同じページへの同時要求が、1回の展開を共有することを確認する。
 @Test func concurrentPageRequestsShareOneExtraction() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
-    let cache = SourceCache(temporaryRoot: root)
+    let cache = SourceCache(temporaryRoot: root, cacheArchiveImagesInMemory: true)
     let source = try await cache.load(streamingFixture("images.zip"))
     let paths = try await withThrowingTaskGroup(of: URL.self) { group in
         for _ in 0..<12 { group.addTask { try await source.preparingImages(at: [2]).images[2].fileURL } }
@@ -120,10 +166,10 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     }
     let storage = try ExtractionStorage(root: root)
     let directory = try TemporaryDirectory(storage: storage)
-    let worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: ReaderLimits())
+    let worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: ReaderLimits(), prefersMemory: true)
     for position in [0, 3, 1, 2] {
         let prepared = try await worker.extract(index.members[position], to: directory.url.appendingPathComponent(UUID().uuidString), speculative: false)
-        let bytes = [UInt8](try Data(contentsOf: prepared.file.url))
+        let bytes = [UInt8](try #require(prepared.file.data))
         #expect(bytes.count == 4096)
         for offset in stride(from: 0, to: bytes.count, by: 4) {
             let k = offset / 4 + 1
@@ -135,22 +181,24 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
 }
 
 // ページ展開のキャンセルで、未完成ファイルと容量予約を解放することを確認する。
-@Test func cancelledPageExtractionRemovesUnfinishedFileAndReservation() async throws {
+@Test(arguments: [false, true])
+func cancelledPageExtractionRemovesUnfinishedDataAndReservation(_ memory: Bool) async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let png = try Data(contentsOf: streamingFixture("portrait.png"))
     let zip = root.appendingPathComponent("cancel.zip")
     try makeZIP(zip, files: [("1.png", png + Data(repeating: 0, count: 1024 * 1024))])
     let index = try ArchiveReader.index(zip)
-    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"))
+    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"),
+                                        memoryCapacity: memory ? 2 * 1024 * 1024 : 0)
     let directory = try TemporaryDirectory(storage: storage)
-    let worker = ArchiveExtractionWorker(url: zip, index: index, directory: directory, limits: ReaderLimits(), progress: { _ in
+    let worker = ArchiveExtractionWorker(url: zip, index: index, directory: directory, limits: ReaderLimits(), prefersMemory: memory, progress: { _ in
         withUnsafeCurrentTask { $0?.cancel() }
     })
     let output = directory.url.appendingPathComponent("cancelled.png")
     let task = Task.detached { try await worker.extract(index.members[0], to: output, speculative: false) }
     do { _ = try await task.value; Issue.record("Cancelled extraction succeeded") }
     catch is CancellationError { }
-    #expect(storage.byteCount == 0 && storage.cachedFileCount == 0)
+    #expect(storage.byteCount == 0 && storage.memoryByteCount == 0 && storage.cachedFileCount == 0)
     #expect(!FileManager.default.fileExists(atPath: output.path))
 }
 
@@ -163,10 +211,10 @@ func selectiveRARReadsMatchFullExtraction(_ name: String) async throws {
     let index = try ArchiveReader.index(url, include: { _ in true })
     #expect(index.members.map(\.path) == expected.map(\.path))
     let directory = try TemporaryDirectory(root: root.appendingPathComponent("cache"))
-    let worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: ReaderLimits())
+    let worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: ReaderLimits(), prefersMemory: true)
     for position in index.members.indices.reversed() {
         let image = try await worker.extract(index.members[position], to: directory.url.appendingPathComponent(UUID().uuidString), speculative: false)
-        #expect(try Data(contentsOf: image.file.url) == Data(contentsOf: expected[position].fileURL))
+        #expect(try #require(image.file.data) == Data(contentsOf: expected[position].fileURL))
     }
 }
 
@@ -188,9 +236,9 @@ func indexRetainsZIPNamesAndZIP64(_ name: String) throws {
         let zip = root.appendingPathComponent(name + ".zip")
         try makeZIP(zip, files: [("1.png", first), ("2.png", portrait + Data(repeating: 0, count: 1024 * 1024))])
         let storage = try ExtractionStorage(root: root.appendingPathComponent(name), capacity: Int64(first.count))
-        let source = try await SourceCache(storage: storage).load(zip, mode: mode)
+        let source = try await SourceCache(storage: storage, cacheArchiveImagesInMemory: true).load(zip, mode: mode)
         #expect(source.images[0].metadata != nil && source.images[1].metadata == nil)
-        #expect(storage.byteCount == Int64(first.count))
+        #expect(storage.memoryByteCount == Int64(first.count) && storage.byteCount == 0)
         #expect(await source.archive?.extractionCount == 1)
     }
 }
@@ -217,9 +265,9 @@ private final class DecodeGate: @unchecked Sendable {
 func pageTurnReusesActiveOrCompletedPrefetch(_ cancelConsumer: Bool) async throws {
     for finishBeforeDisplay in [false, true] {
         let gate = DecodeGate(); defer { gate.resume() }
-        let cache = ImageCache(decoder: { url, pixels, bytes in
+        let cache = ImageCache(decoder: { input, pixels, bytes in
             try gate.pause()
-            return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+            return try ImageDecoder.decode(input, maxPixelSize: pixels, maximumBytes: bytes)
         })
         let url = streamingFixture("portrait.png")
         let speculative = Task { try await cache.image(at: url, maxPixelSize: 1024, use: .prefetch) }
@@ -251,9 +299,9 @@ func pageTurnReusesActiveOrCompletedPrefetch(_ cancelConsumer: Bool) async throw
 @Test(arguments: [false, true])
 func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
     let gate = DecodeGate(); defer { gate.resume() }
-    let cache = ImageCache(decoder: { url, pixels, bytes in
+    let cache = ImageCache(decoder: { input, pixels, bytes in
         try gate.pause()
-        return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        return try ImageDecoder.decode(input, maxPixelSize: pixels, maximumBytes: bytes)
     })
     let speculative = Task { try await cache.image(at: streamingFixture("portrait.png"), maxPixelSize: 1024, use: .prefetch) }
     let deadline = ContinuousClock.now.advanced(by: .seconds(3))
@@ -267,16 +315,18 @@ func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
     #expect(await cache.byteCounts.display == 0)
 }
 
-// 待機要求のキャンセル後も、実デコードが終わるまでは展開ファイルを削除しないことを確認する。
-@Test func cancelledPrefetchKeepsFilePinnedUntilDecoderActuallyFinishes() async throws {
+// 待機要求のキャンセル後も、実デコードが終わるまでは展開データを保持する。
+@Test(arguments: [false, true])
+func cancelledPrefetchKeepsExtractionPinnedUntilDecoderActuallyFinishes(_ memory: Bool) async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
-    let storage = try ExtractionStorage(root: root)
+    let storage = try ExtractionStorage(root: root, memoryCapacity: memory ? 1024 * 1024 : 0)
     let gate = DecodeGate(); defer { gate.resume() }
-    let cache = ImageCache(decoder: { url, pixels, bytes in
+    let cache = ImageCache(decoder: { input, pixels, bytes in
         try gate.pause()
-        return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        return try ImageDecoder.decode(input, maxPixelSize: pixels, maximumBytes: bytes)
     })
-    var prepared: LoadedSource? = try SourceLoader.load(streamingFixture("images.zip"), storage: storage)
+    var prepared: LoadedSource? = try SourceLoader.load(streamingFixture("images.zip"), storage: storage,
+                                                       cacheArchiveImagesInMemory: memory)
     prepared = try await prepared!.preparingImages(at: [0])
     let descriptor = prepared!.unpinned()
     let path = prepared!.images[0].fileURL
@@ -290,11 +340,16 @@ func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
     await cache.cancelPrefetch()
     do { _ = try await task.value; Issue.record("Cancelled prefetch returned an image") } catch is CancellationError { }
     storage.trimFiles()
-    #expect(FileManager.default.fileExists(atPath: path.path))
+    if memory { #expect(storage.memoryByteCount > 0) }
+    else { #expect(FileManager.default.fileExists(atPath: path.path)) }
     gate.resume()
     while await cache.isDecoding, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
     #expect(await cache.isDecoding == false)
-    storage.trimFiles()
+    while storage.memoryByteCount + storage.byteCount > 0 && ContinuousClock.now < deadline {
+        if !memory { storage.trimFiles() }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(storage.memoryByteCount == 0 && storage.byteCount == 0)
     #expect(!FileManager.default.fileExists(atPath: path.path))
     withExtendedLifetime(descriptor) {}
 }
@@ -303,10 +358,10 @@ func discardedActivePrefetchDoesNotRefillCache(_ removeAll: Bool) async throws {
 @Test func obsoleteQueuedDisplayDecodeIsCancelledWithoutWaitingForActiveDecoder() async throws {
     let gate = DecodeGate(); defer { gate.resume() }
     let firstURL = streamingFixture("portrait.png")
-    let cache = ImageCache(decoder: { url, pixels, bytes in
-        #expect(url.path == firstURL.path)
+    let cache = ImageCache(decoder: { input, pixels, bytes in
+        #expect(input.url.path == firstURL.path)
         try gate.pause()
-        return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        return try ImageDecoder.decode(input, maxPixelSize: pixels, maximumBytes: bytes)
     })
     let first = Task { try await cache.image(at: firstURL, maxPixelSize: 1024) }
     let deadline = ContinuousClock.now.advanced(by: .seconds(3))

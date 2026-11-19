@@ -100,6 +100,7 @@ actor ArchiveExtractionWorker {
     private let index: ArchiveIndex
     private let directory: TemporaryDirectory
     private let limits: ReaderLimits
+    private let prefersMemory: Bool
     private let progress: @Sendable (Int64) -> Void
     private var cursor: ArchiveCursor?
     private var nextOrdinal = 0
@@ -107,8 +108,10 @@ actor ArchiveExtractionWorker {
     private var totalExpanded: Int64 = 0
     private(set) var extractionCount = 0
     init(url: URL, index: ArchiveIndex, directory: TemporaryDirectory, limits: ReaderLimits,
+         prefersMemory: Bool,
          progress: @escaping @Sendable (Int64) -> Void = { _ in }) {
         self.url = url; self.index = index; self.directory = directory; self.limits = limits; self.progress = progress
+        self.prefersMemory = prefersMemory
     }
     func relocate(to url: URL) { self.url = url; cursor = nil; nextOrdinal = 0 }
     func extract(_ member: ArchiveMember, to output: URL, speculative: Bool) throws -> PreparedArchiveImage {
@@ -123,30 +126,71 @@ actor ArchiveExtractionWorker {
                     let ordinal = nextOrdinal; nextOrdinal += 1
                     if ordinal == member.ordinal {
                         guard header.regular, header.path == member.path, header.size == member.declaredSize else { throw ReaderError.sourceChanged }
-                        let file = try directory.createFile(at: output, speculative: speculative)
-                        let handle = try FileHandle(forWritingTo: output)
-                        do { try drain(cursor, ordinal: ordinal, image: true, file: file, handle: handle); try handle.close() }
-                        catch { try? handle.close(); throw error }
-                        try Task.checkCancellation()
-                        guard try FileRevision.read(url) == index.revision else { throw ReaderError.sourceChanged }
-                        var metadata: ImageMetadata?; var failure: String?
-                        do { metadata = try ImageDecoder.metadata(at: output, limits: limits) }
-                        catch let error as ReaderError {
-                            if case .limit = error { throw error }
-                            failure = error.localizedDescription
-                        } catch { failure = error.localizedDescription }
-                        file.seal(); extractionCount += 1
-                        return PreparedArchiveImage(metadata: metadata, failure: failure, file: file)
+                        return try readImage(cursor, member: member, output: output, speculative: speculative)
                     }
                     // ZIPと非ソリッドRAR4は本体をスキップし、RAR5は読み進めてソリッド圧縮の辞書状態を維持する。
                     if !cursor.needsSolidDictionary { try cursor.skip() }
-                    else { try drain(cursor, ordinal: ordinal, image: ArchiveReader.isImagePath(header.path), file: nil, handle: nil) }
+                    else { try drain(cursor, ordinal: ordinal, image: ArchiveReader.isImagePath(header.path)) }
                 }
                 throw ReaderError.sourceChanged
             } catch { cursor = nil; nextOrdinal = 0; throw error }
         }
     }
-    private func drain(_ cursor: ArchiveCursor, ordinal: Int, image: Bool, file: ExtractionFileLease?, handle: FileHandle?) throws {
+    private func readImage(_ cursor: ArchiveCursor, member: ArchiveMember, output: URL,
+                           speculative: Bool) throws -> PreparedArchiveImage {
+        let declared = max(0, member.declaredSize)
+        var memory = prefersMemory ? try directory.createMemoryFile(at: output, bytes: declared, speculative: speculative) : nil
+        var data = Data()
+        if memory != nil { data.reserveCapacity(Int(declared)) }
+        func openDisk() throws -> (file: ExtractionFileLease, handle: FileHandle) {
+            let file = try directory.createFile(at: output, speculative: speculative)
+            return (file, try FileHandle(forWritingTo: output))
+        }
+        var disk = memory == nil ? try openDisk() : nil
+        do {
+            try drain(cursor, ordinal: member.ordinal, image: true) { chunk, expandedBytes in
+                if let memory, try memory.reserveMemory(to: expandedBytes) {
+                    data.append(chunk.bindMemory(to: UInt8.self))
+                } else {
+                    guard expandedBytes <= limits.temporaryBytes else { throw ReaderError.limit("一時ディスクキャッシュ2GiB") }
+                    let destination = try disk ?? openDisk()
+                    // 宣言サイズを超えても、展開位置を保ったままディスクへ移す。
+                    if disk == nil {
+                        disk = destination
+                        try destination.file.reserve(Int64(data.count))
+                        try destination.handle.write(contentsOf: data)
+                        data = Data()
+                        memory = nil
+                    }
+                    try destination.file.reserve(Int64(chunk.count))
+                    try destination.handle.write(contentsOf: Data(chunk))
+                }
+                progress(expandedBytes)
+            }
+            try disk?.handle.close()
+        } catch {
+            try? disk?.handle.close()
+            throw error
+        }
+        try Task.checkCancellation()
+        guard try FileRevision.read(url) == index.revision else { throw ReaderError.sourceChanged }
+
+        let input = ImageInput(url: output, data: memory == nil ? nil : data)
+        var metadata: ImageMetadata?; var failure: String?
+        do { metadata = try ImageDecoder.metadata(input, limits: limits) }
+        catch let error as ReaderError {
+            if case .limit = error { throw error }
+            failure = error.localizedDescription
+        } catch { failure = error.localizedDescription }
+        try Task.checkCancellation()
+        guard let file = memory ?? disk?.file else { throw ReaderError.archive("画像の展開先を初期化できません。") }
+        try file.seal(data: input.data)
+        extractionCount += 1
+        return PreparedArchiveImage(metadata: metadata, failure: failure, file: file)
+    }
+
+    private func drain(_ cursor: ArchiveCursor, ordinal: Int, image: Bool,
+                       write: (UnsafeRawBufferPointer, Int64) throws -> Void = { _, _ in }) throws {
         var buffer = [UInt8](repeating: 0, count: 64 * 1024); var count: Int64 = 0
         while true {
             try Task.checkCancellation()
@@ -159,11 +203,7 @@ actor ArchiveExtractionWorker {
             let additional = max(0, count - (expanded[ordinal] ?? 0))
             guard additional <= limits.sourceBytes - totalExpanded else { throw ReaderError.limit("ソース累積展開量") }
             totalExpanded += additional; expanded[ordinal] = max(count, expanded[ordinal] ?? 0)
-            if let file {
-                guard count <= limits.temporaryBytes else { throw ReaderError.limit("一時ディスクキャッシュ2GiB") }
-                try file.reserve(Int64(size)); try handle!.write(contentsOf: Data(buffer.prefix(size)))
-                progress(count)
-            }
+            try buffer.withUnsafeBytes { try write(UnsafeRawBufferPointer(rebasing: $0[..<size]), count) }
         }
     }
 }

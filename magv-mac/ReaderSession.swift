@@ -96,7 +96,7 @@ struct PresentedPage {
         self.temporaryRoot = temporaryRoot
         cache = imageCache
         fileAccess = SessionFileAccess(bookmarkStore: preferences.directoryBookmarkStore)
-        sourceCache = SourceCache(temporaryRoot: temporaryRoot)
+        sourceCache = SourceCache(temporaryRoot: temporaryRoot, cacheArchiveImagesInMemory: true)
         self.wait = wait
         mode = preferences.settings.displayMode
         direction = preferences.settings.readingDirection
@@ -592,14 +592,18 @@ struct PresentedPage {
     // メモリ不足時はルーペと先読みを止め、深刻度に応じてキャッシュを解放する。
     func handleMemoryPressure(critical: Bool) {
         suppressPrefetch = true; cancelPrefetch(); clearLoupe()
-        let root = temporaryRoot
+        let storage = try? ExtractionStorage.shared(root: temporaryRoot)
+        storage?.setMemoryPressure(true)
         Task { [cache, sourceCache] in
-            try? ExtractionStorage.shared(root: root).trimFiles(prefetchedOnly: !critical)
+            storage?.trimFiles(prefetchedOnly: !critical)
             await cache.memoryPressure(critical: critical)
             if critical { await sourceCache.removeAll() } else { await sourceCache.removePrefetched() }
         }
     }
-    func memoryPressureEnded() { suppressPrefetch = false }
+    func memoryPressureEnded() {
+        try? ExtractionStorage.shared(root: temporaryRoot).setMemoryPressure(false)
+        suppressPrefetch = false
+    }
     func resumeWindow() { windowIsOpen = true; if source != nil { render() } }
     func closeWindow() {
         stopSlideshow(); windowIsOpen = false; isEditingInterval = false

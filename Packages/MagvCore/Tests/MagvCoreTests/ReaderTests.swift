@@ -231,17 +231,18 @@ func compressedRAR4Payloads(_ name: String) throws {
     #expect(text == "test text document\r\n")
 }
 
-// ソースの最後の参照を解放すると、一時展開領域も削除されることを確認する。
-@Test func archiveSourceLifecycle() throws {
+// メモリ展開の一覧取得では一時領域を作らず、ディスク展開では参照がなくなると解放する。
+@Test(arguments: [false, true])
+func archiveSourceLifecycle(_ memory: Bool) throws {
     let dir = try temporary(); defer { try? FileManager.default.removeItem(at: dir) }
     func loadAndRelease() throws -> URL {
-        let loaded = try SourceLoader.load(fixture("images.zip"), temporaryRoot: dir)
+        let loaded = try SourceLoader.load(fixture("images.zip"), temporaryRoot: dir, cacheArchiveImagesInMemory: memory)
         #expect(loaded.kind == .archive)
         #expect(loaded.images.count == 3)
         #expect(loaded.images.allSatisfy { $0.metadata == nil })
         #expect(loaded.images.allSatisfy { !FileManager.default.fileExists(atPath: $0.fileURL.path) })
         let extractedDirectory = try #require(loaded.temporaryDirectory?.url)
-        #expect(FileManager.default.fileExists(atPath: extractedDirectory.path))
+        #expect(FileManager.default.fileExists(atPath: extractedDirectory.path) == !memory)
         return extractedDirectory
     }
     let extractedDirectory = try loadAndRelease()

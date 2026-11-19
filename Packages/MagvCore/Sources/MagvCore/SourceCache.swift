@@ -30,8 +30,15 @@ public actor SourceCache {
     private let temporaryRoot: URL?
     private let storage: ExtractionStorage?
     private let countLimit: Int
+    private let cacheArchiveImagesInMemory: Bool
     public init(temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil, countLimit: Int = 3) {
+        self.init(temporaryRoot: temporaryRoot, storage: storage, countLimit: countLimit, cacheArchiveImagesInMemory: false)
+    }
+    /// メモリ展開を選ぶ場合、アーカイブ画像は準備済みソースとともにImageCacheへ渡す。
+    public init(temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil, countLimit: Int = 3,
+                cacheArchiveImagesInMemory: Bool) {
         self.temporaryRoot = temporaryRoot; self.storage = storage; self.countLimit = max(1, countLimit)
+        self.cacheArchiveImagesInMemory = cacheArchiveImagesInMemory
     }
     public func load(_ url: URL, prefetch: Bool = false, initialIndex: Int = 0, mode: DisplayMode = .spread,
                      progress: @escaping @Sendable (String) -> Void = { _ in }) async throws -> LoadedSource {
@@ -53,8 +60,10 @@ public actor SourceCache {
             existing.prefetched = existing.prefetched && prefetch; pending[key] = existing; work = existing
         } else {
             let root = temporaryRoot; let storage = storage
+            let cacheArchiveImagesInMemory = cacheArchiveImagesInMemory
             let task = Task.detached(priority: prefetch ? .utility : .userInitiated) {
-                try SourceLoader.load(url, temporaryRoot: root, storage: storage, progress: progress)
+                try SourceLoader.load(url, temporaryRoot: root, storage: storage,
+                                      cacheArchiveImagesInMemory: cacheArchiveImagesInMemory, progress: progress)
             }
             work = Pending(id: UUID(), task: task, prefetched: prefetch); pending[key] = work
         }

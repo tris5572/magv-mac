@@ -223,9 +223,9 @@ private final class PageDecodeProbe: @unchecked Sendable {
     // キャッシュ単体に加えて、セッション側のキャンセル順序も検証する。
     for url in [folder, fixture.appendingPathComponent("images.zip")] {
         let probe = PageDecodeProbe(); defer { probe.resume() }
-        let cache = ImageCache(decoder: { url, pixels, bytes in
-            try probe.record(url)
-            return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        let cache = ImageCache(decoder: { input, pixels, bytes in
+            try probe.record(input.url)
+            return try ImageDecoder.decode(input, maxPixelSize: pixels, maximumBytes: bytes)
         })
         let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent(UUID().uuidString), imageCache: cache)
         defer { reader.shutdown() }
@@ -252,9 +252,9 @@ private final class PageDecodeProbe: @unchecked Sendable {
     // 未キャッシュ位置へのジャンプ後は、進行方向側の2枚を反対側より先に準備する。
     for forward in [true, false] {
         let probe = PageDecodeProbe(); defer { probe.resume() }
-        let cache = ImageCache(decoder: { url, pixels, bytes in
-            try probe.record(url)
-            return try ImageDecoder.decode(at: url, maxPixelSize: pixels, maximumBytes: bytes)
+        let cache = ImageCache(decoder: { input, pixels, bytes in
+            try probe.record(input.url)
+            return try ImageDecoder.decode(input, maxPixelSize: pixels, maximumBytes: bytes)
         })
         let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent(UUID().uuidString), imageCache: cache)
         defer { reader.shutdown() }

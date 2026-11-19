@@ -3,8 +3,17 @@ import Foundation
 /// 選択URLをアーカイブ・画像・フォルダに分類し、共通のLoadedSourceへ変換する。
 public enum SourceLoader {
     public static func load(_ selectedURL: URL, limits: ReaderLimits = ReaderLimits(),
+                            temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil,
+                            progress: @Sendable (String) -> Void = { _ in }) throws -> LoadedSource {
+        try load(selectedURL, limits: limits, temporaryRoot: temporaryRoot, storage: storage,
+                 cacheArchiveImagesInMemory: false, progress: progress)
+    }
+
+    /// メモリ展開を選ぶ場合、アーカイブ画像は準備済みソースとともにImageCacheへ渡す。
+    public static func load(_ selectedURL: URL, limits: ReaderLimits = ReaderLimits(),
                              temporaryRoot: URL? = nil,
                              storage: ExtractionStorage? = nil,
+                             cacheArchiveImagesInMemory: Bool,
                              progress: @Sendable (String) -> Void = { _ in }) throws -> LoadedSource {
         let url = selectedURL.resolvingSymlinksInPath().standardizedFileURL
         let access = FileAccessLease(url: selectedURL)
@@ -29,8 +38,10 @@ public enum SourceLoader {
                 // アーカイブは一覧だけを先に読み、画像の実体は表示時にArchiveImageStoreで展開する。
                 let index = try ArchiveReader.index(url, limits: limits)
                 guard !index.members.isEmpty else { throw ReaderError.noImages }
-                let directory = try TemporaryDirectory(storage: storage ?? ExtractionStorage.shared(root: temporaryRoot))
-                let images = ArchiveImageStore(url: url, index: index, directory: directory, access: access, limits: limits)
+                let directory = try TemporaryDirectory(storage: storage ?? ExtractionStorage.shared(root: temporaryRoot),
+                                                       createOnDisk: !cacheArchiveImagesInMemory)
+                let images = ArchiveImageStore(url: url, index: index, directory: directory, access: access, limits: limits,
+                                               prefersMemory: cacheArchiveImagesInMemory)
                 let siblings = try? FileAccessService.siblings(of: url, kind: .archive)
                 return LoadedSource(url: url, kind: .archive, images: images.initialEntries, initialIndex: nil, access: access, temporaryDirectory: directory, siblings: siblings ?? [url],
                 needsParentAccess: siblings == nil, isPartialDirectory: false, revision: index.revision, archive: images)

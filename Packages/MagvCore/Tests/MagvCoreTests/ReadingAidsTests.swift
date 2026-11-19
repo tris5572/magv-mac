@@ -89,7 +89,7 @@ private func aidTemporary() throws -> URL {
     let archive = root.appendingPathComponent("book.zip")
     try FileManager.default.copyItem(at: aidFixture("images.zip"), to: archive)
     let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"))
-    let cache = SourceCache(storage: storage)
+    let cache = SourceCache(storage: storage, cacheArchiveImagesInMemory: true)
     let paths = try await withThrowingTaskGroup(of: URL.self) { group in
         for _ in 0..<8 { group.addTask { try await cache.load(archive).temporaryDirectory!.url } }
         var result: [URL] = []
@@ -98,21 +98,24 @@ private func aidTemporary() throws -> URL {
     }
     #expect(Set(paths).count == 1)
     let previous = try await cache.load(archive)
-    let size = try previous.images.prefix(2).reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
-    #expect(storage.byteCount == size)
+    let size = try previous.images.prefix(2).reduce(Int64(0)) {
+        try $0 + Int64(#require(previous.extraction(at: $1.fileURL)?.data).count)
+    }
+    #expect(storage.memoryByteCount == size && storage.byteCount == 0)
     // 同じ内容・サイズで不可分に置換してもinodeが変わるため、キャッシュキーは失効する。
     try Data(contentsOf: archive).write(to: archive, options: .atomic)
     let replaced = try await cache.load(archive)
     #expect(replaced.temporaryDirectory!.url != previous.temporaryDirectory!.url)
     // 外部で保持中の旧ソースは、最後の利用者が解放するまで読み込める。
-    #expect(FileManager.default.fileExists(atPath: previous.images[0].fileURL.path))
-    #expect(storage.byteCount == size * 2)
+    #expect(previous.extraction(at: previous.images[0].fileURL)?.data != nil)
+    #expect(storage.memoryByteCount == size * 2 && storage.byteCount == 0)
 }
 
 // フォルダ変更の再読み込みと、保持件数を超えた際の古いソースの削除を確認する。
 @Test func sourceCacheRefreshesDirectoryAndEvictsLeastRecentlyUsed() async throws {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
-    let cache = SourceCache(temporaryRoot: root.appendingPathComponent("cache"), countLimit: 2)
+    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), memoryCapacity: 0)
+    let cache = SourceCache(storage: storage, countLimit: 2)
     var archives: [URL] = []
     for index in 0..<3 {
         let url = root.appendingPathComponent("\(index).zip")
@@ -139,7 +142,7 @@ private func aidTemporary() throws -> URL {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let entries = try ArchiveReader.extract(aidFixture("images.zip"), into: root)
     let size = try entries.prefix(2).reduce(Int64(0)) { try $0 + Int64($1.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize!) }
-    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: size + 1)
+    let storage = try ExtractionStorage(root: root.appendingPathComponent("cache"), capacity: size + 1, memoryCapacity: 0)
     let cache = SourceCache(storage: storage)
     let first = try await cache.load(aidFixture("images.zip"))
     let other = root.appendingPathComponent("other.zip")
@@ -147,7 +150,7 @@ private func aidTemporary() throws -> URL {
     await #expect(throws: ReaderError.limit("一時ディスクキャッシュ全体2GiB")) { _ = try await cache.load(other) }
     #expect(storage.byteCount == size)
     #expect(FileManager.default.fileExists(atPath: first.images[0].fileURL.path))
-    let emptyStorage = try ExtractionStorage(root: root.appendingPathComponent("empty-cache"), capacity: 1)
+    let emptyStorage = try ExtractionStorage(root: root.appendingPathComponent("empty-cache"), capacity: 1, memoryCapacity: 0)
     let emptyCache = SourceCache(storage: emptyStorage)
     await #expect(throws: ReaderError.limit("一時ディスクキャッシュ全体2GiB")) {
         _ = try await emptyCache.load(other)
@@ -188,7 +191,7 @@ private func aidTemporary() throws -> URL {
     let root = try aidTemporary(); defer { try? FileManager.default.removeItem(at: root) }
     let old = root.appendingPathComponent("old.zip")
     try FileManager.default.copyItem(at: aidFixture("images.zip"), to: old)
-    let cache = SourceCache(temporaryRoot: root.appendingPathComponent("cache"))
+    let cache = SourceCache(temporaryRoot: root.appendingPathComponent("cache"), cacheArchiveImagesInMemory: true)
     let original = try await cache.load(old)
     let renamedURL = try FileAccessService.renameArchive(at: old, baseName: "new", expectedRevision: original.revision)
     await cache.relocate(original.relocated(to: renamedURL), from: old)

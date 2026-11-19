@@ -1,6 +1,6 @@
 import Foundation
 
-/// ディスクから画像が削除されても寸法情報は残し、必要な画像だけを展開・利用中だけ保持する。
+/// 展開データがキャッシュから外れても寸法情報を保持し、必要な画像だけを展開する。
 public actor ArchiveImageStore {
     private struct Known { let metadata: ImageMetadata?; let failure: String?; let fileID: UUID }
     private struct Pending {
@@ -17,16 +17,17 @@ public actor ArchiveImageStore {
     private var known: [Int: Known] = [:]
     private var pending: [Int: Pending] = [:]
 
-    init(url: URL, index: ArchiveIndex, directory: TemporaryDirectory, access: FileAccessLease, limits: ReaderLimits) {
+    init(url: URL, index: ArchiveIndex, directory: TemporaryDirectory, access: FileAccessLease, limits: ReaderLimits,
+         prefersMemory: Bool) {
         self.url = url; self.index = index; self.directory = directory; self.access = access
         initialEntries = index.members.map { member in
             ImageEntry(id: "\(member.ordinal):\(member.path)", name: member.path,
                 fileURL: directory.url.appendingPathComponent(UUID().uuidString).appendingPathExtension((member.path as NSString).pathExtension))
         }
-        worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: limits)
+        worker = ArchiveExtractionWorker(url: url, index: index, directory: directory, limits: limits, prefersMemory: prefersMemory)
     }
 
-    /// 寸法だけの要求では既知情報を使い、ファイルが必要な要求では削除を防ぐリースを返す。
+    /// 寸法が既知なら再利用し、展開データが必要ならリースを返す。
     func prepare(_ indices: [Int], files: Bool, speculative: Bool) async throws -> (images: [ImageEntry], leases: [ExtractionFileLease]) {
         try Task.checkCancellation()
         guard try FileRevision.read(url) == index.revision else { throw ReaderError.sourceChanged }

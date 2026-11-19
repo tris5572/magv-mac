@@ -13,14 +13,15 @@ import MagvCore
             try generate(URL(fileURLWithPath: path, isDirectory: true), large: arguments.first == "--generate-large"); return
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("magv-benchmark-" + UUID().uuidString)
-        let storage = try ExtractionStorage(root: root)
-        defer { storage.cleanOwnedAtExit(); try? FileManager.default.removeItem(at: root) }
+        let storage = try ExtractionStorage(root: root.appendingPathComponent("memory"))
+        let disk = try ExtractionStorage(root: root.appendingPathComponent("disk"), memoryCapacity: 0)
+        defer { storage.cleanOwnedAtExit(); disk.cleanOwnedAtExit(); try? FileManager.default.removeItem(at: root) }
         for path in arguments where path != "--compare" {
             let url = URL(fileURLWithPath: path)
-            if arguments.contains("--compare"), SourceFormat.archiveExtensions.contains(url.pathExtension.lowercased()) {
-                try await measureEager(url, storage: storage)
-            }
+            let compare = arguments.contains("--compare") && SourceFormat.archiveExtensions.contains(url.pathExtension.lowercased())
+            if compare { try await measure(url, storage: disk) }
             try await measure(url, storage: storage)
+            if compare { try await measureEager(url, storage: disk) }
         }
     }
     static func milliseconds(_ duration: Duration) -> Double {
@@ -28,7 +29,7 @@ import MagvCore
     }
     // 初期表示、先読み後の移動、同じ本の再訪を分けて測定する。UI描画時間は含まない。
     static func measure(_ url: URL, storage: ExtractionStorage) async throws {
-        let sources = SourceCache(storage: storage)
+        let sources = SourceCache(storage: storage, cacheArchiveImagesInMemory: storage.memoryCapacity > 0)
         let images = ImageCache()
         let clock = ContinuousClock()
         let start = clock.now
@@ -36,7 +37,8 @@ import MagvCore
         let page = PageNavigator.page(at: 0, orientations: source.images.map(\.orientation), mode: .spread)!
         for index in page.visibleIndices { _ = try await images.image(at: source.images[index].fileURL, maxPixelSize: 2048, retaining: source) }
         let initial = milliseconds(start.duration(to: clock.now))
-        let initialBytes = storage.byteCount
+        let initialMemory = storage.memoryByteCount
+        let initialDisk = storage.byteCount
         let nextAnchor = (page.visibleIndices.last ?? 0) + 1
         let warmed = try await source.preparingImages(at: [nextAnchor, nextAnchor + 1], prefetch: true)
         let next = PageNavigator.move(.next, from: page, orientations: warmed.images.map(\.orientation), mode: .spread)!
@@ -51,10 +53,13 @@ import MagvCore
         let revisit = milliseconds(revisitStart.duration(to: clock.now))
         let counts = await images.byteCounts
         var usage = rusage(); getrusage(RUSAGE_SELF, &usage)
-        print("\(url.lastPathComponent): \(source.images.count) images (on-demand)")
-        print(String(format: "  extraction at first display: %.2f MiB", Double(initialBytes) / 1048576))
+        let mode = source.kind == .directory ? "direct" : storage.memoryCapacity > 0 ? "on-demand, memory first" : "on-demand, disk only"
+        print("\(url.lastPathComponent): \(source.images.count) images (\(mode))")
+        print(String(format: "  extraction at first display: %.2f MiB memory, %.2f MiB disk", Double(initialMemory) / 1048576, Double(initialDisk) / 1048576))
         print(String(format: "  load + first spread decode: %.2f ms; cached next spread: %.3f ms; source revisit: %.3f ms", initial, turn, revisit))
-        print(String(format: "  image cache: %.2f MiB; extraction: %.2f MiB; process peak RSS: %.2f MiB", Double(counts.display) / 1048576, Double(storage.byteCount) / 1048576, Double(usage.ru_maxrss) / 1048576))
+        print(String(format: "  decoded: %.2f MiB; extraction: %.2f MiB memory, %.2f MiB disk; process peak RSS: %.2f MiB",
+                     Double(counts.display) / 1048576, Double(storage.memoryByteCount) / 1048576,
+                     Double(storage.byteCount) / 1048576, Double(usage.ru_maxrss) / 1048576))
         await sources.removeAll(); await images.removeAll()
     }
     // 全画像を先に展開・寸法取得する経路を、選択展開との比較基準として測る。

@@ -30,7 +30,7 @@ public struct ImageMetadata: Sendable {
 public struct ImageEntry: Identifiable, Sendable {
     public let id: String
     public let name: String
-    // アーカイブ内画像の実体は、preparingImagesが返したソースを保持している間だけ保証される。
+    // メモリ内のアーカイブ画像では識別用URLになる。ImageCacheへ準備済みのソースも渡す。
     public let fileURL: URL
     public var metadata: ImageMetadata?
     public var failure: String?
@@ -62,7 +62,7 @@ public struct LoadedSource: Sendable {
         let prepared = try await archive.prepare(indices, files: false, speculative: prefetch)
         var result = self; result.images = prepared.images; return result
     }
-    /// 指定画像のファイルを準備し、返したソースが保持されている間は削除から保護する。
+    /// 指定画像の展開データを準備し、返したソースが保持されている間は削除から保護する。
     public func preparingImages(at indices: [Int], prefetch: Bool = false) async throws -> LoadedSource {
         guard let archive else { return self }
         let prepared = try await archive.prepare(indices, files: true, speculative: prefetch)
@@ -79,6 +79,7 @@ public struct LoadedSource: Sendable {
     }
     // 一覧キャッシュは画像ファイルを固定せず、容量不足時にページ単位で削除できるようにする。
     func unpinned() -> LoadedSource { var result = self; result.fileLeases = []; return result }
+    func extraction(at url: URL) -> ExtractionFileLease? { fileLeases.first { $0.url == url } }
     init(url: URL, kind: SourceKind, images: [ImageEntry], initialIndex: Int?, access: FileAccessLease,
          temporaryDirectory: TemporaryDirectory?, siblings: [URL], needsParentAccess: Bool,
          isPartialDirectory: Bool, revision: FileRevision?, archive: ArchiveImageStore? = nil) {
