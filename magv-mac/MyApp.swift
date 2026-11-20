@@ -24,15 +24,15 @@ import UniformTypeIdentifiers
     private var eventMonitor: Any?
     private var recentMenu: NSMenu?
     private var accessPanel: NSOpenPanel?
-    private var renameSheet: RenameSheetController?
+    private var renamePanel: RenamePanelController?
     private var transitioningFullScreen = false
     private var memoryPressure: DispatchSourceMemoryPressure?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenus()
         session.refreshWindow = { [weak self] in self?.readerWindow?.title = self?.session.title ?? "magv" }
-        session.showRenameEditor = { [weak self] in self?.presentRenameSheet() }
-        session.willOpenSource = { [weak self] in self?.renameSheet?.dismiss(); self?.accessPanel?.cancel(nil) }
+        session.showRenameEditor = { [weak self] in self?.presentRenamePanel() }
+        session.willOpenSource = { [weak self] in self?.renamePanel?.dismiss(); self?.accessPanel?.cancel(nil) }
         session.requestDirectoryAccess = { [weak self] directory, reason, completion in
             self?.requestDirectoryAccess(directory, reason: reason, completion: completion)
         }
@@ -97,7 +97,7 @@ import UniformTypeIdentifiers
     func windowShouldClose(_ sender: NSWindow) -> Bool { !session.isRenaming }
     func windowWillClose(_ notification: Notification) {
         if let window = notification.object as? NSWindow { saveWindowFrame(window) }
-        preferences.flush(); renameSheet?.dismiss(); session.closeWindow(); NSCursor.setHiddenUntilMouseMoves(false); readerWindow = nil
+        preferences.flush(); renamePanel?.dismiss(); session.closeWindow(); NSCursor.setHiddenUntilMouseMoves(false); readerWindow = nil
     }
     func windowDidResignKey(_ notification: Notification) { NSCursor.setHiddenUntilMouseMoves(false); session.clearLoupe() }
     @objc private func willSleep() { session.suspendSlideshow() }
@@ -134,6 +134,7 @@ import UniformTypeIdentifiers
 
     // 既存のウィンドウを再利用し、新規作成時だけ保存済みの位置とサイズを復元する。
     private func showReader() {
+        if let renamePanel { renamePanel.panel.makeKeyAndOrderFront(nil); return }
         if let readerWindow { readerWindow.makeKeyAndOrderFront(nil); return }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -149,7 +150,7 @@ import UniformTypeIdentifiers
     @objc func openPanel(_ sender: Any?) {
         showReader(); NSCursor.setHiddenUntilMouseMoves(false)
         guard let window = readerWindow else { return }
-        guard !session.isRenaming, window.attachedSheet == nil else { return }
+        guard renamePanel == nil, !session.isRenaming, window.attachedSheet == nil else { return }
         let panel = NSOpenPanel()
         panel.title = "漫画を開く"; panel.prompt = "開く"
         panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
@@ -163,27 +164,30 @@ import UniformTypeIdentifiers
     // フォルダ選択をシートで提示する。選択先の妥当性と権限保持はセッション側で扱う。
     private func requestDirectoryAccess(_ directory: URL, reason: String, completion: @escaping (URL?) -> Void) {
         showReader(); NSCursor.setHiddenUntilMouseMoves(false)
-        guard let window = readerWindow, window.attachedSheet == nil else { completion(nil); return }
+        guard renamePanel == nil, let window = readerWindow, window.attachedSheet == nil else { completion(nil); return }
         let panel = NSOpenPanel(); accessPanel = panel
         panel.title = "フォルダへのアクセスを許可"
         panel.message = reason + "\n「\(directory.lastPathComponent)」フォルダを選択してください。"
         panel.prompt = "このフォルダを許可"; panel.directoryURL = directory
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = false; panel.allowsMultipleSelection = false
         panel.beginSheetModal(for: window) { [weak self] response in
+            let selected = response == .OK ? panel.url : nil
+            // 許可の直後に名前変更を表示できるよう、親から選択シートを外してから続ける。
+            panel.orderOut(nil)
             self?.accessPanel = nil
-            completion(response == .OK ? panel.url : nil)
+            completion(selected)
         }
     }
 
-    private func presentRenameSheet() {
+    private func presentRenamePanel() {
         showReader()
         guard let window = readerWindow, window.attachedSheet == nil, let source = session.source else { session.isEditingName = false; return }
         let previous = session.sourceDestination(.previous)?.lastPathComponent
         let next = session.sourceDestination(.next)?.lastPathComponent
-        let sheet = RenameSheetController(source: source, previous: previous, next: next,
+        let panel = RenamePanelController(source: source, previous: previous, next: next,
             submit: { [weak self] name, completion in self?.session.renameArchive(to: name, completion: completion) },
-            finished: { [weak self] in self?.session.isEditingName = false; self?.renameSheet = nil })
-        renameSheet = sheet; sheet.present(on: window)
+            finished: { [weak self] in self?.session.isEditingName = false; self?.renamePanel = nil })
+        renamePanel = panel; panel.present(on: window)
     }
 
     @objc private func beginRename(_ sender: Any?) { showReader(); session.beginRename() }
@@ -302,7 +306,7 @@ import UniformTypeIdentifiers
     }
     // 操作可能かどうかはセッションの判定を使い、メニューと実操作の条件を揃える。
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if readerWindow?.attachedSheet != nil { return false }
+        if renamePanel != nil || readerWindow?.attachedSheet != nil { return false }
         if menuItem.action == #selector(toggleLoupe(_:)) { return session.canRead }
         if menuItem.action == #selector(toggleSlideshow(_:)) { return session.isSlideshowPlaying || session.canStartSlideshow }
         if menuItem.action == #selector(editInterval(_:)) || menuItem.action == #selector(setInterval(_:)) { return readerWindow != nil && !session.isRenaming }

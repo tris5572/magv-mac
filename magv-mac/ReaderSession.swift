@@ -298,15 +298,24 @@ struct PresentedPage {
         stopSlideshow(); cancelPrefetch()
         authorizeParent { [weak self] in
             guard let self, self.canRename, let source = self.source else { return }
+            if self.archiveNeighbors != nil {
+                self.refreshNeighborhood()
+                self.openRenameEditor()
+                return
+            }
             let id = self.requestID
             self.isSelectingSource = true; self.neighborhoodTask?.cancel()
             self.neighborhoodTask = Task { [weak self] in
                 let urls = try? await Task.detached { try FileAccessService.siblings(of: source.url, kind: source.kind) }.value
                 guard !Task.isCancelled, let self, self.requestID == id else { return }
                 self.updateNeighborhood(urls, for: source); self.isSelectingSource = false
-                self.isEditingName = true; NSCursor.setHiddenUntilMouseMoves(false); self.showRenameEditor?()
+                self.openRenameEditor()
             }
         }
+    }
+
+    private func openRenameEditor() {
+        isEditingName = true; NSCursor.setHiddenUntilMouseMoves(false); showRenameEditor?()
     }
 
     func addBangPrefix() {

@@ -91,8 +91,8 @@ import ImageIO
         let oldImagePaths = session.source!.images.map(\.fileURL)
         session.jump(to: 2); try await waitForOpen()
         session.authorizeDirectory(root)
-        session.beginRename(); try await waitForOpen()
-        try require(session.isEditingName, "Rename editor did not start")
+        session.beginRename()
+        try require(session.isEditingName, "Rename waited for a folder refresh despite having captured neighbors")
         func rename(_ name: String) async -> Result<Void, Error> {
             await withCheckedContinuation { continuation in
                 session.renameArchive(to: name) { continuation.resume(returning: $0) }
@@ -175,7 +175,7 @@ import ImageIO
         try await pagePrefetchSmoke(root: root, fixture: fixture)
         try await renameNavigationSmoke(root: root, fixture: fixture)
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
-        if CommandLine.arguments.contains("--ui") { try await renameSheetSmoke(root: root, fixture: fixture) }
+        if CommandLine.arguments.contains("--ui") { try await renamePanelSmoke(root: root, fixture: fixture) }
     }
 }
 
@@ -414,8 +414,8 @@ private final class PageDecodeProbe: @unchecked Sendable {
     print("Rename navigation smoke passed: A → rename → B → A's predecessor, fresh cached opens, per-open neighbors, repeated rename/bang/collision, refresh, additions/deletions, first/last")
 }
 
-// 追加指定時のみ、閲覧ウィンドウを表示せずAppKitの実際の入力エディターとシートを検証する。
-@MainActor private func renameSheetSmoke(root: URL, fixture: URL) async throws {
+// 追加指定時のみ、閲覧ウィンドウを表示せずAppKitの実際の入力エディターとパネルを検証する。
+@MainActor private func renamePanelSmoke(root: URL, fixture: URL) async throws {
     _ = NSApplication.shared
     let directory = root.appendingPathComponent("rename-sheet", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -425,12 +425,12 @@ private final class PageDecodeProbe: @unchecked Sendable {
     let session = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: directory.appendingPathComponent("cache"))
     defer { session.shutdown() }
     func require(_ condition: Bool, _ message: String) throws {
-        if !condition { throw NSError(domain: "RenameSheetSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+        if !condition { throw NSError(domain: "RenamePanelSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
     }
     func settle(_ ready: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while !ready() {
-            try require(ContinuousClock.now < deadline, "Rename sheet timed out")
+            try require(ContinuousClock.now < deadline, "Rename panel timed out")
             try await Task.sleep(for: .milliseconds(5))
         }
     }
@@ -459,26 +459,29 @@ private final class PageDecodeProbe: @unchecked Sendable {
         var result: Result<Void, Error>?
         var finished = false
         session.isEditingName = true
-        let sheet = RenameSheetController(source: source, previous: previous, next: next, submit: { name, completion in
+        let controller = RenamePanelController(source: source, previous: previous, next: next, submit: { name, completion in
             submitted = name
             session.renameArchive(to: name) { value in result = value; completion(value) }
         }, finished: { finished = true; session.isEditingName = false })
-        sheet.present(on: window)
-        defer { sheet.dismiss() }
-        let content = sheet.panel.contentView!
+        controller.present(on: window)
+        defer { controller.dismiss() }
+        let panel = controller.panel
+        let content = panel.contentView!
         let views = descendants(content)
         guard let field = views.compactMap({ $0 as? NSTextField }).first(where: \.isEditable),
               let change = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == "変更" }),
               let editor = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing field editor") }
+        try require(panel.firstResponder === editor && editor.selectedRange() == NSRange(location: 0, length: editor.string.utf16.count),
+                    "The existing filename is not ready to replace immediately after presentation")
         func requireBottomPadding() throws {
             content.layoutSubtreeIfNeeded()
             let buttonFrame = content.convert(change.bounds, from: change)
             let bottomPadding = content.isFlipped ? content.bounds.maxY - buttonFrame.maxY : buttonFrame.minY - content.bounds.minY
-            try require(abs(bottomPadding - 20) <= 1, "Rename sheet has extra space below the buttons: \(bottomPadding) pt")
+            try require(abs(bottomPadding - 20) <= 1, "Rename panel has extra space below the buttons: \(bottomPadding) pt")
         }
         let labels = views.compactMap { $0 as? NSTextField }.filter { !$0.isEditable && !$0.isHiddenOrHasHiddenAncestor }
         let expectedLabels = [previous, "." + source.url.pathExtension, next?.replacingOccurrences(of: "\n", with: " ")].compactMap { $0 }
-        try require(labels.map(\.stringValue).sorted() == expectedLabels.sorted(), "Rename sheet has unexpected labels")
+        try require(labels.map(\.stringValue).sorted() == expectedLabels.sorted(), "Rename panel has unexpected labels")
         try requireBottomPadding()
         let singleLineHeight = NSTextField(labelWithString: ".ZIP").intrinsicContentSize.height
         try require(labels.allSatisfy { $0.frame.height <= singleLineHeight + 1 }, "A filename label took up multiple lines")
@@ -493,7 +496,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
             submitted = nil; result = nil
             let oldURL = session.source!.url
             let oldPage = session.page
-            sheet.panel.makeFirstResponder(field)
+            panel.makeFirstResponder(field)
             guard let active = field.currentEditor() as? NSTextView else { throw ReaderError.rename("Missing retry editor") }
             active.insertText(name, replacementRange: NSRange(location: 0, length: active.string.utf16.count))
             if name == longName { try requireHorizontalScrolling(active, in: field) }
@@ -503,12 +506,12 @@ private final class PageDecodeProbe: @unchecked Sendable {
             try require(submitted == name, "Rename submitted stale field text")
             switch result! {
             case .success:
-                try require(succeeds && finished, "Invalid name was accepted or sheet did not close")
+                try require(succeeds && finished, "Invalid name was accepted or the panel did not close")
                 let newURL = directory.appendingPathComponent(name).appendingPathExtension(oldURL.pathExtension)
                 try require(!FileManager.default.fileExists(atPath: oldURL.path), "Original file still exists after rename")
                 try require(try Data(contentsOf: newURL) == bytes, "Renamed file is missing or changed")
                 try require(session.source?.url == newURL && session.presentedPage?.sourceURL == newURL && session.title == newURL.lastPathComponent && session.page == oldPage,
-                            "Rename sheet lost reader identity or page")
+                            "Rename panel lost reader identity or page")
             case .failure(let error):
                 try require(!succeeds && !finished && field.isEnabled && field.stringValue == name, "Failed rename lost the edited name")
                 try require(session.source?.url == oldURL && (try Data(contentsOf: oldURL)) == bytes, "Failed rename changed the file")
@@ -522,7 +525,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
     let multilineNeighbor = String(repeating: "X\n", count: 125) + ".zip"
     try await exercise(button: false, previous: "前のファイル.zip", next: multilineNeighbor, attempts: [(longName, true)])
     try await exercise(button: true, attempts: [("invalid/name", false), ("変更ボタンで確定", true)])
-    print("Rename sheet smoke passed: filename labels, bottom padding, horizontal scrolling, Return/button, invalid-name retry, IME guard, on-disk rename")
+    print("Rename panel smoke passed: immediate selection, filename labels, bottom padding, horizontal scrolling, Return/button, invalid-name retry, IME guard, on-disk rename")
 }
 
 // 準備中は旧画面を保ち、新しい見開きが揃った時点で表示をまとめて切り替えることを確認する。

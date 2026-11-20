@@ -12,8 +12,8 @@ import MagvCore
     static func shouldSubmit(hasMarkedText: Bool, wasComposing: Bool) -> Bool { !hasMarkedText && !wasComposing }
 }
 
-/// 拡張子を保持した名前変更シート。送信中は入力を止め、失敗時は同じシートで再入力する。
-@MainActor final class RenameSheetController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
+/// 拡張子を保持した名前変更パネル。送信中は入力を止め、失敗時は同じパネルで再入力する。
+@MainActor final class RenamePanelController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     private static let contentWidth: CGFloat = 460
     private let padding: CGFloat = 20
     let panel: NSPanel
@@ -25,13 +25,19 @@ import MagvCore
     private let stack = NSStackView()
     private let submit: (String, @escaping (Result<Void, Error>) -> Void) -> Void
     private let finished: () -> Void
+    private var isPresented = false
 
     init(source: LoadedSource, previous: String?, next: String?,
          submit: @escaping (String, @escaping (Result<Void, Error>) -> Void) -> Void, finished: @escaping () -> Void) {
         self.submit = submit; self.finished = finished
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.contentWidth, height: 0), styleMask: [.titled], backing: .buffered, defer: false)
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.contentWidth, height: 0),
+                        styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
         panel.title = "名前を変更"; panel.delegate = self; panel.isReleasedWhenClosed = false
+        panel.titleVisibility = .hidden; panel.titlebarAppearsTransparent = true
+        panel.animationBehavior = .none
+        panel.isExcludedFromWindowsMenu = true
+        panel.collectionBehavior.insert(.fullScreenAuxiliary)
         editor.isFieldEditor = true
         nameField.delegate = self; nameField.font = .systemFont(ofSize: 15)
         nameField.cell?.isScrollable = true
@@ -73,6 +79,7 @@ import MagvCore
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: padding)
         ])
         resizeToFit()
+        panel.initialFirstResponder = nameField
     }
 
     private func resizeToFit() {
@@ -81,8 +88,23 @@ import MagvCore
 
     func present(on window: NSWindow) {
         NSCursor.setHiddenUntilMouseMoves(false)
-        window.beginSheet(panel)
-        panel.makeFirstResponder(nameField); nameField.selectText(nil)
+        var frame = panel.frame
+        frame.origin = NSPoint(x: window.frame.midX - frame.width / 2, y: window.frame.midY - frame.height / 2)
+        panel.setFrame(panel.constrainFrameRect(frame, to: window.screen), display: false)
+        isPresented = true
+        window.addChildWindow(panel, ordered: .above)
+        panel.makeKeyAndOrderFront(nil)
+        nameField.selectText(nil)
+        // イベント処理や非同期コールバックから抜けてから、モーダルイベントループを開始する。
+        RunLoop.main.perform { [weak self] in
+            MainActor.assumeIsolated { self?.runModal() }
+        }
+    }
+
+    private func runModal() {
+        guard isPresented else { return }
+        NSApp.runModal(for: panel)
+        dismiss()
     }
     func windowWillReturnFieldEditor(_ sender: NSWindow, to client: Any?) -> Any? { client as? NSTextField === nameField ? editor : nil }
 
@@ -119,7 +141,10 @@ import MagvCore
     private func setBusy(_ busy: Bool) { nameField.isEnabled = !busy; submitButton.isEnabled = !busy; cancelButton.isEnabled = !busy }
     @objc private func cancel() { guard cancelButton.isEnabled else { return }; dismiss() }
     func dismiss() {
-        panel.sheetParent?.endSheet(panel)
+        guard isPresented else { return }
+        isPresented = false
+        if NSApp.modalWindow === panel { NSApp.stopModal() }
+        panel.parent?.removeChildWindow(panel)
         panel.orderOut(nil); finished()
     }
 }
