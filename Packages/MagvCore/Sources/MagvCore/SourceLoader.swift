@@ -15,6 +15,13 @@ public enum SourceLoader {
                              storage: ExtractionStorage? = nil,
                              cacheArchiveImagesInMemory: Bool,
                              progress: @Sendable (String) -> Void = { _ in }) throws -> LoadedSource {
+        try load(selectedURL, limits: limits, temporaryRoot: temporaryRoot, storage: storage,
+                 cacheArchiveImagesInMemory: cacheArchiveImagesInMemory, includeArchiveSiblings: true, progress: progress)
+    }
+
+    static func load(_ selectedURL: URL, limits: ReaderLimits = ReaderLimits(),
+                     temporaryRoot: URL?, storage: ExtractionStorage?, cacheArchiveImagesInMemory: Bool,
+                     includeArchiveSiblings: Bool, progress: @Sendable (String) -> Void) throws -> LoadedSource {
         let url = selectedURL.resolvingSymlinksInPath().standardizedFileURL
         let access = FileAccessLease(url: selectedURL)
         do {
@@ -42,7 +49,7 @@ public enum SourceLoader {
                                                        createOnDisk: !cacheArchiveImagesInMemory)
                 let images = ArchiveImageStore(url: url, index: index, directory: directory, access: access, limits: limits,
                                                prefersMemory: cacheArchiveImagesInMemory)
-                let siblings = try? FileAccessService.siblings(of: url, kind: .archive)
+                let siblings = includeArchiveSiblings ? try? FileAccessService.siblings(of: url, kind: .archive) : nil
                 return LoadedSource(url: url, kind: .archive, images: images.initialEntries, initialIndex: nil, access: access, temporaryDirectory: directory, siblings: siblings ?? [url],
                 needsParentAccess: siblings == nil, isPartialDirectory: false, revision: index.revision, archive: images)
             } else if SourceFormat.isImage(url.lastPathComponent) {

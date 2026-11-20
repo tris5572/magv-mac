@@ -26,6 +26,20 @@ private func write(_ name: String, in directory: URL, content: String = "archive
     #expect(try FileAccessService.siblings(of: hidden, kind: .archive).contains(hidden))
 }
 
+@Test func siblingURLsResolveTheParentAndExcludeLinks() throws {
+    let root = try testDirectory(); defer { try? FileManager.default.removeItem(at: root) }
+    let books = root.appendingPathComponent("books", isDirectory: true)
+    try FileManager.default.createDirectory(at: books, withIntermediateDirectories: false)
+    let first = try write("1.zip", in: books)
+    let second = try write("2.ZIP", in: books)
+    try FileManager.default.createSymbolicLink(at: books.appendingPathComponent("3.zip"), withDestinationURL: first)
+    let alias = root.appendingPathComponent("alias", isDirectory: true)
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: books)
+    let expected = [first, second].map { $0.resolvingSymlinksInPath().standardizedFileURL }
+    let source = alias.appendingPathComponent("1.zip").resolvingSymlinksInPath().standardizedFileURL
+    #expect(try FileAccessService.siblings(of: source, kind: .archive) == expected)
+}
+
 // 兄弟一覧の両端で停止し、ランダム移動が現在の本を選ばないことを確認する。
 @Test func siblingEdgesAndRandomExclusion() {
     let urls = ["1.zip", "2.zip", "10.zip"].map { URL(fileURLWithPath: "/books/" + $0) }

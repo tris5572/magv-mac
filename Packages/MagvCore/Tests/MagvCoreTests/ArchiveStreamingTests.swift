@@ -55,6 +55,23 @@ private func makeZIP(_ url: URL, files: [(String, Data)]) throws {
     #expect(decoded.image.height > decoded.image.width)
 }
 
+@Test func archiveListingWaitsForTheRequestedPage() async throws {
+    let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }
+    let zip = root.appendingPathComponent("book.zip")
+    let png = try Data(contentsOf: streamingFixture("portrait.png"))
+    try makeZIP(zip, files: [("1.png", png), ("2.png", png), ("3.png", png)])
+    try FileManager.default.copyItem(at: zip, to: root.appendingPathComponent("neighbor.zip"))
+    let cache = SourceCache(temporaryRoot: root.appendingPathComponent("cache"),
+                            cacheArchiveImagesInMemory: true, includeArchiveSiblings: false)
+    let listing = try await cache.loadListing(zip)
+    #expect(listing.siblings.count == 1)
+    #expect(await listing.archive?.extractionCount == 0)
+
+    let page = try await listing.preparingPage(at: 2, mode: .single)
+    #expect(page.images.map(\.orientation) == [.unknown, .unknown, .portrait])
+    #expect(await page.archive?.extractionCount == 1)
+}
+
 // 表示中の画像がメモリ枠を使い切っていても、次の画像を一時ファイルから表示できる。
 @Test func pinnedMemoryContentsSpillNextImageToDisk() async throws {
     let root = try streamingTemporary(); defer { try? FileManager.default.removeItem(at: root) }

@@ -31,17 +31,32 @@ public actor SourceCache {
     private let storage: ExtractionStorage?
     private let countLimit: Int
     private let cacheArchiveImagesInMemory: Bool
+    private let includeArchiveSiblings: Bool
     public init(temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil, countLimit: Int = 3) {
         self.init(temporaryRoot: temporaryRoot, storage: storage, countLimit: countLimit, cacheArchiveImagesInMemory: false)
     }
     /// メモリ展開を選ぶ場合、アーカイブ画像は準備済みソースとともにImageCacheへ渡す。
     public init(temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil, countLimit: Int = 3,
                 cacheArchiveImagesInMemory: Bool) {
+        self.init(temporaryRoot: temporaryRoot, storage: storage, countLimit: countLimit,
+                  cacheArchiveImagesInMemory: cacheArchiveImagesInMemory, includeArchiveSiblings: true)
+    }
+    public init(temporaryRoot: URL? = nil, storage: ExtractionStorage? = nil, countLimit: Int = 3,
+                cacheArchiveImagesInMemory: Bool, includeArchiveSiblings: Bool) {
         self.temporaryRoot = temporaryRoot; self.storage = storage; self.countLimit = max(1, countLimit)
         self.cacheArchiveImagesInMemory = cacheArchiveImagesInMemory
+        self.includeArchiveSiblings = includeArchiveSiblings
     }
     public func load(_ url: URL, prefetch: Bool = false, initialIndex: Int = 0, mode: DisplayMode = .spread,
                      progress: @escaping @Sendable (String) -> Void = { _ in }) async throws -> LoadedSource {
+        let source = try await loadListing(url, prefetch: prefetch, progress: progress)
+        progress("表示するページを準備中…")
+        return try await source.preparingPage(at: initialIndex, mode: mode, prefetch: prefetch)
+    }
+
+    /// 画像一覧を取得する。実際の表示位置が決まった時点で、必要なページを準備できる。
+    public func loadListing(_ url: URL, prefetch: Bool = false,
+                            progress: @escaping @Sendable (String) -> Void = { _ in }) async throws -> LoadedSource {
         let key = try await Task.detached(priority: prefetch ? .utility : .userInitiated) { try SourceFingerprint.read(url) }.value
         try Task.checkCancellation()
         if !prefetch { await cancelPrefetch(except: url); try Task.checkCancellation() }
@@ -51,8 +66,7 @@ public actor SourceCache {
         clock &+= 1
         if var value = values[key] {
             value.touched = clock; value.prefetched = value.prefetched && prefetch; values[key] = value
-            progress("表示するページを準備中…")
-            return try await prepare(value.source, at: initialIndex, mode: mode, prefetch: prefetch)
+            return value.source
         }
         let work: Pending
         // 先読み中の本を開く場合も同じ読み込みを共有し、通常の要求へ昇格させる。
@@ -61,9 +75,11 @@ public actor SourceCache {
         } else {
             let root = temporaryRoot; let storage = storage
             let cacheArchiveImagesInMemory = cacheArchiveImagesInMemory
+            let includeArchiveSiblings = includeArchiveSiblings
             let task = Task.detached(priority: prefetch ? .utility : .userInitiated) {
                 try SourceLoader.load(url, temporaryRoot: root, storage: storage,
-                                      cacheArchiveImagesInMemory: cacheArchiveImagesInMemory, progress: progress)
+                                      cacheArchiveImagesInMemory: cacheArchiveImagesInMemory,
+                                      includeArchiveSiblings: includeArchiveSiblings, progress: progress)
             }
             work = Pending(id: UUID(), task: task, prefetched: prefetch); pending[key] = work
         }
@@ -75,16 +91,11 @@ public actor SourceCache {
                 trim()
             }
             try Task.checkCancellation()
-            progress("表示するページを準備中…")
-            return try await prepare(result, at: initialIndex, mode: mode, prefetch: prefetch)
+            return result
         } catch {
             if pending[key]?.id == work.id { pending[key] = nil }
             throw error
         }
-    }
-    private func prepare(_ source: LoadedSource, at index: Int, mode: DisplayMode, prefetch: Bool) async throws -> LoadedSource {
-        let anchor = min(max(0, index), max(0, source.images.count - 1))
-        return try await source.preparingPage(at: anchor, mode: mode, prefetch: prefetch)
     }
     private func trim() {
         while values.count > countLimit { if !evictOldest() { break } }

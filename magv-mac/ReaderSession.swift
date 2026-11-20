@@ -96,7 +96,7 @@ struct PresentedPage {
         self.temporaryRoot = temporaryRoot
         cache = imageCache
         fileAccess = SessionFileAccess(bookmarkStore: preferences.directoryBookmarkStore)
-        sourceCache = SourceCache(temporaryRoot: temporaryRoot, cacheArchiveImagesInMemory: true)
+        sourceCache = SourceCache(temporaryRoot: temporaryRoot, cacheArchiveImagesInMemory: true, includeArchiveSiblings: false)
         self.wait = wait
         mode = preferences.settings.displayMode
         direction = preferences.settings.readingDirection
@@ -137,33 +137,40 @@ struct PresentedPage {
                 self.loadingMessage = message
             }
         }
-        let hint = positions[inputURL.resolvingSymlinksInPath().standardizedFileURL] ?? 0
         openTask = Task { [weak self, sourceCache] in
             await sourceCache.cancelLoads(except: inputURL)
             do {
-                let loaded = try await sourceCache.load(inputURL, initialIndex: hint, mode: self?.mode ?? .spread, progress: reportProgress)
+                let loaded = try await sourceCache.loadListing(inputURL, progress: reportProgress)
                 try Task.checkCancellation()
                 guard let self, self.requestID == id else { return }
                 self.rememberPosition()
                 // 直接選択した画像を最優先し、それ以外は起動中に記録した閲覧位置から再開する。
                 let remembered = (userSelection ? loaded.initialIndex : nil) ?? self.positions[loaded.url] ?? 0
                 let index = min(max(0, remembered), loaded.images.count - 1)
-                let prepared = try await loaded.preparingPage(at: index, mode: self.mode)
-                // 先読み・キャッシュに残る一覧が名前変更前の可能性があるため、アーカイブの兄弟一覧を取り直す。
-                let urls = prepared.kind == .archive
-                    ? try? await Task.detached { try FileAccessService.siblings(of: prepared.url, kind: prepared.kind) }.value
-                    : (prepared.needsParentAccess ? nil : prepared.siblings)
+                reportProgress("表示するページを準備中…")
+                var mode = self.mode
+                var prepared = try await loaded.preparingPage(at: index, mode: mode)
+                try Task.checkCancellation()
+                // ページ準備後に一覧を取得し、その時点の前後を確定する。
+                let urls = loaded.kind == .archive
+                    ? try? await Task.detached { try FileAccessService.siblings(of: loaded.url, kind: .archive) }.value
+                    : (loaded.needsParentAccess ? nil : loaded.siblings)
+                while mode != self.mode {
+                    try Task.checkCancellation()
+                    mode = self.mode
+                    prepared = try await prepared.preparingPage(at: index, mode: mode)
+                }
                 guard !Task.isCancelled, self.requestID == id else { return }
                 self.cancelNavigation()
                 self.source = prepared; self.imageFailures = [:]
                 self.archiveNeighbors = nil; self.updateNeighborhood(urls, for: prepared)
-                self.page = PageNavigator.page(at: index, orientations: prepared.images.map(\.orientation), mode: self.mode)
+                self.page = PageNavigator.page(at: index, orientations: prepared.images.map(\.orientation), mode: mode)
                 self.recentURLs.removeAll { $0 == loaded.url }; self.recentURLs.insert(loaded.url, at: 0)
                 self.recentURLs = Array(self.recentURLs.prefix(20))
                 self.fileAccess.remember(source: loaded.url, selected: inputURL)
                 self.fileAccess.trim(to: self.recentURLs)
                 self.isLoading = false; self.rememberPosition(); self.refreshWindow?(); self.render(); self.hideCursor?()
-                self.refreshNeighborhood()
+                if prepared.kind == .directory { self.refreshNeighborhood() }
             } catch is CancellationError {
                 guard let self, self.requestID == id else { return }
                 self.isLoading = false; self.fileAccess.trim(to: self.recentURLs)

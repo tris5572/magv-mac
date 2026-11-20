@@ -55,22 +55,29 @@ public enum FileAccessService {
     /// 同じ親フォルダから、アーカイブ同士またはフォルダ同士の移動候補を自然順で返す。
     public static func siblings(of source: URL, kind: SourceKind) throws -> [URL] {
         do {
-            var urls = try FileManager.default.contentsOfDirectory(at: source.deletingLastPathComponent(),
+            let parent = source.deletingLastPathComponent()
+            var entries = try FileManager.default.contentsOfDirectory(at: parent,
                 includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
-                .filter { url in
+                .compactMap { url -> (name: String, url: URL)? in
+                    try Task.checkCancellation()
+                    if kind == .archive, !SourceFormat.archiveExtensions.contains(url.pathExtension.lowercased()) { return nil }
                     guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]),
-                          values.isSymbolicLink != true else { return false }
-                    return kind == .archive
-                        ? values.isRegularFile == true && SourceFormat.archiveExtensions.contains(url.pathExtension.lowercased())
-                        : values.isDirectory == true
+                          values.isSymbolicLink != true,
+                          (kind == .archive ? values.isRegularFile == true : values.isDirectory == true) else { return nil }
+                    let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+                    return (resolved.lastPathComponent, resolved)
                 }
             // 明示的に開いた、または名前変更で隠し項目になったソースも、移動時の現在位置として含める。
-            if !urls.contains(where: { sameLocation($0, source) }),
+            let resolvedSource = source.resolvingSymlinksInPath().standardizedFileURL
+            let sourcePath = resolvedSource.path
+            if !entries.contains(where: { $0.url.path == sourcePath }),
                let values = try? source.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey]),
-               (kind == .archive ? values.isRegularFile == true : values.isDirectory == true) { urls.append(source) }
-            // 名前変更で旧パスが消える前に、SourceLoaderと同じ正規化済みURLに揃える。
-            return urls.map { $0.resolvingSymlinksInPath().standardizedFileURL }
-                .sorted { SourceFormat.naturalOrder($0.lastPathComponent, $1.lastPathComponent) }
+               (kind == .archive ? values.isRegularFile == true : values.isDirectory == true) {
+                entries.append((resolvedSource.lastPathComponent, resolvedSource))
+            }
+            try Task.checkCancellation()
+            entries.sort { SourceFormat.naturalOrder($0.name, $1.name) }
+            return entries.map(\.url)
         } catch let error as CocoaError where error.code == .fileReadNoPermission { throw ReaderError.permission }
     }
 
