@@ -24,7 +24,9 @@ struct PresentedPage {
     var loupeEnabled = false { didSet { if !loupeEnabled { clearLoupe() } } }
     private(set) var loupeIndex: Int?
     private(set) var loupeImage: DecodedImage?
-    var isLoading = false
+    private(set) var isLoading = false {
+        didSet { if !isLoading && loadingMessage != nil { loadingMessage = nil } }
+    }
     private var isDecoding = false
     private(set) var isPreparingPage = false
     var isRendering: Bool { isDecoding || isPreparingPage }
@@ -37,7 +39,7 @@ struct PresentedPage {
     var siblings: [URL] = []
     var needsParentAccess = false
     var errorTitle = "操作できませんでした"
-    var loadingMessage = "読み込み中…"
+    private(set) var loadingMessage: String?
     var errorMessage: String? {
         didSet { if errorMessage != nil { NSCursor.setHiddenUntilMouseMoves(false) } }
     }
@@ -130,16 +132,26 @@ struct PresentedPage {
         neighborhoodTask?.cancel(); isSelectingSource = false
         openTask?.cancel()
         let id = UUID(); requestID = id
-        isLoading = true; loadingMessage = "\(url.lastPathComponent)を読み込み中…"; errorMessage = nil
-        let reportProgress: @Sendable (String) -> Void = { [weak self] message in
-            Task { @MainActor [weak self] in
-                guard let self, self.requestID == id, self.isLoading else { return }
-                self.loadingMessage = message
-            }
-        }
+        isLoading = true; loadingMessage = nil; errorMessage = nil
         openTask = Task { [weak self, sourceCache] in
             await sourceCache.cancelLoads(except: inputURL)
             do {
+                try Task.checkCancellation()
+                let isArchive = await Task.detached(priority: .userInitiated) {
+                    let resolvedURL = inputURL.resolvingSymlinksInPath().standardizedFileURL
+                    return SourceFormat.archiveExtensions.contains(resolvedURL.pathExtension.lowercased()) &&
+                        (try? resolvedURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true
+                }.value
+                try Task.checkCancellation()
+                guard self?.requestID == id else { return }
+                if !isArchive { self?.loadingMessage = "\(url.lastPathComponent)を読み込み中…" }
+                let reportProgress: @Sendable (String) -> Void = { [weak self] message in
+                    guard !isArchive else { return }
+                    Task { @MainActor [weak self] in
+                        guard let self, self.requestID == id, self.isLoading else { return }
+                        self.loadingMessage = message
+                    }
+                }
                 let loaded = try await sourceCache.loadListing(inputURL, progress: reportProgress)
                 try Task.checkCancellation()
                 guard let self, self.requestID == id else { return }

@@ -2,6 +2,8 @@ import AppKit
 @testable import MagvCore
 import CArchive
 import ImageIO
+import Observation
+import Synchronization
 
 // test.shがアプリ本体のReaderSession・InputRouterと一緒にコンパイルする結合テスト。
 @main struct SessionSmoke {
@@ -22,14 +24,24 @@ import ImageIO
         func require(_ condition: Bool, _ message: String) throws {
             if !condition { throw NSError(domain: "SessionSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
         }
-        func waitForOpen() async throws {
+        func waitForOpen(showedProgress: Bool? = nil) async throws {
+            let progressChanged = Mutex(session.loadingMessage != nil)
+            if showedProgress != nil {
+                withObservationTracking { _ = session.loadingMessage } onChange: {
+                    progressChanged.withLock { $0 = true }
+                }
+            }
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
             while session.isLoading || session.isRendering || session.isSelectingSource || session.isRenaming {
                 if ContinuousClock.now > deadline { throw NSError(domain: "SessionSmoke", code: 2, userInfo: [NSLocalizedDescriptionKey: "Open timed out"]) }
                 try await Task.sleep(for: .milliseconds(5))
             }
+            if let showedProgress {
+                try require(progressChanged.withLock { $0 } == showedProgress, "Unexpected open progress visibility")
+                try require(session.loadingMessage == nil, "Open progress stayed visible after loading")
+            }
         }
-        session.open(folders[0]); try await waitForOpen()
+        session.open(folders[0]); try await waitForOpen(showedProgress: true)
         try require(session.source?.images.count == 4, "Folder load failed")
         session.jump(to: 2); try await waitForOpen()
         session.open(folders[1]); try await waitForOpen()
@@ -37,7 +49,7 @@ import ImageIO
         try require(session.page?.anchorIndex == 2, "In-process position wasn't restored")
         let currentURL = session.source?.url
         let currentPage = session.page
-        session.open(root.appendingPathComponent("missing.zip")); try await waitForOpen()
+        session.open(root.appendingPathComponent("missing.zip")); try await waitForOpen(showedProgress: false)
         try require(session.source?.url == currentURL && session.page == currentPage, "Failed open replaced the current book")
         try require(session.errorMessage != nil, "Failed open wasn't reported")
         session.errorMessage = nil
@@ -52,7 +64,7 @@ import ImageIO
         try require(Set(session.recentURLs).count == 20, "Recent items contain duplicates")
         session.open(folders[20]); try await waitForOpen()
         try require(session.recentURLs.count == 20 && session.recentURLs.first == folders[20], "Recent item order is incorrect")
-        session.open(folders[0].appendingPathComponent("2.png")); try await waitForOpen()
+        session.open(folders[0].appendingPathComponent("2.png")); try await waitForOpen(showedProgress: true)
         try require(session.page?.anchorIndex == 1, "Direct image did not override history")
         let left = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
             windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 123)!
@@ -87,7 +99,16 @@ import ImageIO
 
         let archive = root.appendingPathComponent("a.b.ZIP")
         try FileManager.default.copyItem(at: fixture.appendingPathComponent("images.zip"), to: archive)
-        session.open(archive); try await waitForOpen()
+        let archiveLink = root.appendingPathComponent("archive-link")
+        try FileManager.default.createSymbolicLink(at: archiveLink, withDestinationURL: archive)
+        let zipFolder = root.appendingPathComponent("folder.ZIP", isDirectory: true)
+        try FileManager.default.createDirectory(at: zipFolder, withIntermediateDirectories: false)
+        try data.write(to: zipFolder.appendingPathComponent("1.png"))
+        session.open(archiveLink); try await waitForOpen(showedProgress: false)
+        try require(session.source?.url == archive, "Archive link did not open its target")
+        session.open(zipFolder); try await waitForOpen(showedProgress: true)
+        try require(session.source?.url == zipFolder, "Directory with an archive extension did not open")
+        session.open(archive); try await waitForOpen(showedProgress: false)
         let oldImagePaths = session.source!.images.map(\.fileURL)
         session.jump(to: 2); try await waitForOpen()
         session.authorizeDirectory(root)

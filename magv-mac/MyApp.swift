@@ -47,8 +47,13 @@ import UniformTypeIdentifiers
         // 入力欄やシートが操作中ならキーを奪わず、キャンバス上の閲覧操作だけを扱う。
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.window === self.readerWindow, self.readerWindow?.attachedSheet == nil,
-                  !(self.readerWindow?.firstResponder is NSTextView),
-                  !(self.readerWindow?.firstResponder is NSControl), self.session.canRead,
+                  !(self.readerWindow?.firstResponder is NSTextView) else { return event }
+            // 進捗表示が出ていない間もEscで開く処理を取り消せるようにする。
+            if self.session.isLoading, self.session.loadingMessage == nil, event.keyCode == 53,
+               event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty {
+                self.session.cancelOpen(); return nil
+            }
+            guard !(self.readerWindow?.firstResponder is NSControl), self.session.canRead,
                   let action = InputRouter.action(for: event, direction: self.session.direction) else { return event }
             switch action {
             case .page(let command): self.session.move(command)

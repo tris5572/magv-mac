@@ -59,10 +59,10 @@ struct ContentView: View {
                         Color.clear.frame(height: 16)
                     }.frame(height: 102).onHover { hoverControls = $0 }
                 }
-                if session.isLoading {
+                if let loadingMessage = session.loadingMessage {
                     VStack(spacing: 12) {
                         ProgressView()
-                        Text(session.loadingMessage).font(.callout).lineLimit(2)
+                        Text(loadingMessage).font(.callout).lineLimit(2)
                         Button("キャンセル") { session.cancelOpen() }.keyboardShortcut(.cancelAction)
                     }.padding(28).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
