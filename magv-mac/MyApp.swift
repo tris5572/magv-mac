@@ -145,7 +145,18 @@ import UniformTypeIdentifiers
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = session.title; window.contentMinSize = NSSize(width: 320, height: 240)
         window.isReleasedWhenClosed = false; window.delegate = self
-        window.contentView = NSHostingView(rootView: ContentView(session: session, openPanel: { [weak self] in self?.openPanel(nil) }))
+        window.contentView = NSHostingView(rootView: ContentView(
+            session: session,
+            openPanel: { [weak self] in self?.openPanel(nil) },
+            openDroppedFile: { [weak self, weak window] url in
+                guard let self, let window, window === self.readerWindow else { return }
+                NSApp.activate()
+                window.makeKeyAndOrderFront(nil)
+                // アプリのアクティブ化が完了する前でも、ドロップ先を前面に出す。
+                if !NSApp.isActive { window.orderFrontRegardless() }
+                self.session.open(url)
+            }
+        ))
         window.center()
         if let saved = preferences.settings.window?.frame,
            let frame = WindowPlacement.restore(saved, visibleFrames: visibleScreenFrames, minimumSize: window.minSize) { window.setFrame(frame, display: false) }

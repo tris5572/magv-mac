@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @Bindable var session: ReaderSession
     let openPanel: () -> Void
+    let openDroppedFile: @MainActor (URL) -> Void
     @State private var hoverControls = false
     @State private var showPageLoading = false
 
@@ -89,12 +90,12 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .frame(minWidth: 320, minHeight: 240)
-        // ドロップから受け取った最初のURLを、メインアクター上でセッションへ渡す。
+        // ドロップから受け取った最初のURLをメインアクター上で開く。
         .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
-                Task { @MainActor in session.open(url) }
+                Task { @MainActor in openDroppedFile(url) }
             }
             return true
         }
