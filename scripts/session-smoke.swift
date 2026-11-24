@@ -196,7 +196,10 @@ import Synchronization
         try await pagePrefetchSmoke(root: root, fixture: fixture)
         try await renameNavigationSmoke(root: root, fixture: fixture)
         print("Session smoke passed: slideshow/loupe/memory pressure and core reader, sibling switching, empty/deleted candidates, rename/history/cache, bang collision, stale grants, IME guard, settings")
-        if CommandLine.arguments.contains("--ui") { try await renamePanelSmoke(root: root, fixture: fixture) }
+        if CommandLine.arguments.contains("--ui") {
+            try await loupeCanvasSmoke(root: root, fixture: fixture)
+            try await renamePanelSmoke(root: root, fixture: fixture)
+        }
     }
 }
 
@@ -586,13 +589,7 @@ private final class PageDecodeProbe: @unchecked Sendable {
         _ = NSApplication.shared
         let canvas = CanvasView(session: reader)
         canvas.frame = NSRect(x: 0, y: 0, width: 320, height: 480)
-        let context = CGContext(data: nil, width: 320, height: 480, bitsPerComponent: 8, bytesPerRow: 1280,
-            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
-        canvas.draw(canvas.bounds)
-        NSGraphicsContext.restoreGraphicsState()
-        return Data(bytes: context.data!, count: context.bytesPerRow * context.height)
+        return canvasPixels(canvas)
     }
     reader.open(folder); try await settle()
     reader.loupeEnabled = true
@@ -642,6 +639,83 @@ private final class PageDecodeProbe: @unchecked Sendable {
     reader.shutdown()
     try require(reader.presentedPage == nil && reader.decoded.isEmpty, "Shutdown retained the presented frame")
     print("Page presentation smoke passed: retained frame, atomic spread, rapid jumps, resize, failures, archive cancellation/source switch\(verifyCanvas ? ", canvas pixel comparison" : "")")
+}
+
+@MainActor private func canvasPixels(_ canvas: CanvasView) -> Data {
+    let width = Int(canvas.bounds.width); let height = Int(canvas.bounds.height)
+    let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 4 * width,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    NSGraphicsContext.saveGraphicsState()
+    defer { NSGraphicsContext.restoreGraphicsState() }
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+    canvas.draw(canvas.bounds)
+    return Data(bytes: context.data!, count: context.bytesPerRow * context.height)
+}
+
+// 画面上のマウスを動かさず、マウスイベントとキーウィンドウの変化を再現する。
+@MainActor private final class LoupeSmokeWindow: NSWindow {
+    var keyForTest = true
+    var pointerForTest = CGPoint.zero
+    override var isKeyWindow: Bool { keyForTest }
+    override var mouseLocationOutsideOfEventStream: NSPoint { pointerForTest }
+}
+
+@MainActor private func loupeCanvasSmoke(root: URL, fixture: URL) async throws {
+    _ = NSApplication.shared
+    let reader = ReaderSession(preferences: ReaderPreferencesStore(store: nil), temporaryRoot: root.appendingPathComponent("loupe-cache"))
+    let canvas = CanvasView(session: reader)
+    let window = LoupeSmokeWindow(contentRect: CGRect(x: 0, y: 0, width: 720, height: 480),
+        styleMask: [.titled], backing: .buffered, defer: false)
+    window.setFrameOrigin(CGPoint(x: 520, y: 160))
+    window.contentView = canvas
+    defer { window.contentView = nil; reader.shutdown() }
+    canvas.layout()
+    reader.mode = .single
+    reader.open(fixture.appendingPathComponent("images.zip"))
+    func require(_ condition: Bool, _ message: String) throws {
+        if !condition { throw NSError(domain: "LoupeCanvasSmoke", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+    }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    while reader.isLoading || reader.isRendering {
+        try require(ContinuousClock.now < deadline, "Loupe fixture timed out")
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    try require(reader.decoded[0] != nil, "Loupe fixture did not display")
+    let regular = canvasPixels(canvas)
+    let center = CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
+    let location = canvas.convert(center, to: nil)
+    let screenLocation = window.convertPoint(toScreen: location)
+    let move = NSEvent.mouseEvent(with: .mouseMoved, location: screenLocation, modifierFlags: [], timestamp: 0,
+        windowNumber: 0, context: nil, eventNumber: 0, clickCount: 0, pressure: 0)!
+    try require(move.window == nil, "Expected a mouse event in screen coordinates")
+
+    reader.loupeEnabled = true
+    canvas.mouseMoved(with: move)
+    canvas.layout()
+    let magnified = canvasPixels(canvas)
+    try require(reader.loupeIndex == 0 && magnified != regular, "Mouse move did not place the loupe at the event location")
+
+    window.pointerForTest = location
+    window.keyForTest = false
+    NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+    try require(reader.loupeIndex == nil && canvasPixels(canvas) == regular, "Inactive window kept the loupe")
+    window.keyForTest = true
+    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+    try require(reader.loupeIndex == 0 && canvasPixels(canvas) == magnified, "Key window did not restore the loupe under a stationary pointer")
+    canvas.mouseExited(with: NSEvent.enterExitEvent(with: .mouseExited, location: location, modifierFlags: [],
+        timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!)
+    try require(reader.loupeIndex == nil && canvasPixels(canvas) == regular, "Mouse exit left the loupe visible")
+
+    let otherClick = NSEvent.mouseEvent(with: .otherMouseDown, location: screenLocation, modifierFlags: [],
+        timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+    let click = otherClick.cgEvent!
+    click.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+    let middleClick = NSEvent(cgEvent: click)!
+    canvas.otherMouseDown(with: middleClick)
+    try require(!reader.loupeEnabled, "Middle click did not disable the loupe")
+    canvas.otherMouseDown(with: middleClick)
+    try require(reader.loupeIndex == 0 && canvasPixels(canvas) == magnified, "Middle click did not show the loupe at the click location")
+    print("Loupe canvas smoke passed: event coordinates, drawn lens, focus restoration, mouse exit, middle click")
 }
 
 // 意図的にキャンセルを無視し、古いタイマーの完了をセッションの世代IDで拒否できるか検証する。

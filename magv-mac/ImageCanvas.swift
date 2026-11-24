@@ -25,6 +25,7 @@ struct ImageCanvas: NSViewRepresentable {
     private var wheelAmount: CGFloat = 0
     private var wheelTurned = false
     private var lastPreciseScrollTime: TimeInterval = 0
+    private var pointerInWindow: CGPoint?
     // 配置計算を左上原点に統一し、画像そのものを描くときだけ上下を反転する。
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -32,10 +33,22 @@ struct ImageCanvas: NSViewRepresentable {
     init(session: ReaderSession) { self.session = session; super.init(frame: .zero) }
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if let window { NotificationCenter.default.removeObserver(self, name: nil, object: window) }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.acceptsMouseMovedEvents = true
-        window?.makeFirstResponder(self)
+        if let window {
+            window.acceptsMouseMovedEvents = true
+            window.makeFirstResponder(self)
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                         NSWindow.didMoveNotification, NSWindow.didResizeNotification] {
+                NotificationCenter.default.addObserver(self, selector: #selector(windowDidChange), name: name, object: window)
+            }
+        }
+        syncPointer()
     }
 
     override func layout() {
@@ -98,9 +111,9 @@ struct ImageCanvas: NSViewRepresentable {
     }
     // 余白や上部パネルを除き、実際に描画した画像矩形の中だけをルーペ対象にする。
     private func hoveredImage() -> (Int, CGRect, CGPoint)? {
-        guard let window, window.isKeyWindow, let presented = session.presentedPage else { return nil }
+        guard window?.isKeyWindow == true, let pointerInWindow, let presented = session.presentedPage else { return nil }
         let page = presented.page
-        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let point = convert(pointerInWindow, from: nil)
         guard bounds.contains(point), point.y >= 102 else { return nil }
         let indices = session.direction == .rightToLeft ? Array(page.visibleIndices.reversed()) : page.visibleIndices
         let width = bounds.width / CGFloat(indices.count)
@@ -112,21 +125,54 @@ struct ImageCanvas: NSViewRepresentable {
         }
         return nil
     }
+
+    // ウィンドウの位置やキー状態が変わった場合は、マウスイベントを待たずに位置を取り直す。
+    @objc private func windowDidChange(_ notification: Notification) { syncPointer() }
+
+    private func syncPointer() {
+        pointerInWindow = window?.isKeyWindow == true ? window?.mouseLocationOutsideOfEventStream : nil
+        refreshLoupe()
+    }
+
+    private func pointerLocation(for event: NSEvent) -> CGPoint? {
+        guard let window else { return nil }
+        let location = event.locationInWindow
+        let eventWindow = event.window
+        if eventWindow === window { return location }
+        // ウィンドウを持たないイベントの位置はスクリーン座標で届く。
+        return window.convertPoint(fromScreen: eventWindow?.convertPoint(toScreen: location) ?? location)
+    }
+
     func refreshLoupe() {
         if session.canUseLoupe, let (index, rect, _) = hoveredImage() {
             session.requestLoupe(index: index, displayedSize: rect.size, backingScale: window?.backingScaleFactor ?? 1)
         } else if session.loupeIndex != nil { session.clearLoupe() }
         needsDisplay = true
     }
+
     override func otherMouseDown(with event: NSEvent) {
-        if event.buttonNumber == 2, session.canRead { session.loupeEnabled.toggle(); refreshLoupe() }
-        else { super.otherMouseDown(with: event) }
+        if event.buttonNumber == 2, session.canRead {
+            pointerInWindow = pointerLocation(for: event)
+            session.loupeEnabled.toggle()
+            refreshLoupe()
+        } else { super.otherMouseDown(with: event) }
     }
 
     override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self) }
-    override func mouseMoved(with event: NSEvent) { NSCursor.setHiddenUntilMouseMoves(false); refreshLoupe() }
-    override func mouseEntered(with event: NSEvent) { refreshLoupe() }
-    override func mouseExited(with event: NSEvent) { NSCursor.setHiddenUntilMouseMoves(false); session.clearLoupe(); needsDisplay = true }
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.setHiddenUntilMouseMoves(false)
+        pointerInWindow = pointerLocation(for: event)
+        refreshLoupe()
+    }
+    override func mouseEntered(with event: NSEvent) {
+        pointerInWindow = pointerLocation(for: event)
+        refreshLoupe()
+    }
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.setHiddenUntilMouseMoves(false)
+        pointerInWindow = nil
+        refreshLoupe()
+    }
 
     override func scrollWheel(with event: NSEvent) {
         guard event.momentumPhase.isEmpty, abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX), session.canRead else { return }
